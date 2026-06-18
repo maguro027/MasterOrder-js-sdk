@@ -1,0 +1,17 @@
+{
+  "name": "@waterpunch/masterorder-js-sdk",
+  "version": "1.1.0",
+  "private": true,
+  "description": "MasterOrder browser SDK — Core / Staff / Order layers (canonical source in js-sdk/)",
+  "files": [
+    "api-routes.js",
+    "core-sdk.js",
+    "staff-sdk.js",
+    "client-sdk.js",
+    "order-sdk.js",
+    "menu-image-url.js"
+  ],
+  "scripts": {
+    "verify": "node -e \"const fs=require('fs');['api-routes.js','core-sdk.js','staff-sdk.js','order-sdk.js'].forEach(f=>{if(!fs.existsSync(f))throw new Error('missing '+f)});\""
+  }
+}
