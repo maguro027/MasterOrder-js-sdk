@@ -1,6 +1,17 @@
 # MasterOrder JS SDK
 
-ブラウザ向け SDK の **正本** は monorepo 直下の [`js-sdk/`](./) です。  
+ブラウザ向け SDK。**Core / Order / Staff** の 3 レイヤに分かれた構成です。
+
+```
+MasterOrder-js-sdk/
+├── sdk-manifest.json   … レイヤ定義（同期スクリプトが参照）
+├── core/               … 共通基盤（HTTP, routes, 画像 URL）
+├── order/              … 来客注文
+└── staff/              … 店舗スタッフ
+```
+
+各フォルダの README にモジュール一覧があります。
+
 **すべての Server 通信は SDK 経由** — UI から `fetch('/sessions/...')` 等を直接書かず、各レイヤのファクトリを使ってください。
 
 ---
@@ -15,32 +26,33 @@
 | **Order**（来客） | 同上 | **なし**（PIN + REST） |
 | **Server** | Firestore / D1 / KV | Admin SDK |
 
-- ブラウザは **Firestore に直接接続しない**（`api-routes.js` が URL を検証）。
+- ブラウザは **Firestore に直接接続しない**（`core/api-routes.js` が URL を検証）。
 - リアルタイムは Server が Firestore を購読し **SSE** で fan-out。
-- 詳細: [docs/architecture/NODE_API_FIRESTORE_BOUNDARY.md](../docs/architecture/NODE_API_FIRESTORE_BOUNDARY.md)
 
 ### 3 レイヤ構成
 
 ```
-api-routes.js     ルート定義（HTTP 正本・パスビルダー）
-core-sdk.js       Core — 共通 HTTP / SSE / 正規化 / 日時
-├── staff-sdk.js  Staff — 店舗スタッフ API + SSE ヘルパー
-└── order-sdk.js  Order — 来客 API + セッション / QR / ブランディング
-menu-image-url.js 画像 URL ユーティリティ（R2、SDK 外だが同梱）
+core/api-routes.js     ルート定義（HTTP 正本・パスビルダー）
+core/core-sdk.js       Core — 共通 HTTP / SSE / 正規化 / 日時
+├── staff/staff-sdk.js Staff — 店舗スタッフ API + SSE ヘルパー
+└── order/order-sdk.js Order — 来客 API + セッション / QR / ブランディング
+core/menu-image-url.js 画像 URL ユーティリティ（R2、同梱）
 ```
 
-| ファイル | グローバル | 用途 |
-|----------|------------|------|
-| `api-routes.js` | `MasterOrderApiRoutes` | ルートメタデータ + `paths.staff` / `paths.guest` |
-| `core-sdk.js` | `MasterOrderCoreSdk` | 共通基盤 |
-| `staff-sdk.js` | `MasterOrderStaffSdk` | 店舗スタッフ（**推奨**） |
-| `client-sdk.js` | — | 互換シム（`staff-sdk.js` 単体で `MasterOrderClientSdk` も設定済み） |
-| `order-sdk.js` | `MasterOrderOrderSdk` / `MasterOrderSdk` | 来客 |
-| `menu-image-url.js` | `MasterOrderMenuImage` | メニュー画像 URL |
+| パス | グローバル | 用途 |
+|------|------------|------|
+| `core/api-routes.js` | `MasterOrderApiRoutes` | ルートメタデータ + `paths.staff` / `paths.guest` |
+| `core/core-sdk.js` | `MasterOrderCoreSdk` | 共通基盤 |
+| `staff/staff-sdk.js` | `MasterOrderStaffSdk` | 店舗スタッフ（**推奨**） |
+| `staff/client-sdk.js` | — | 互換シム（`staff-sdk.js` 単体で `MasterOrderClientSdk` も設定済み） |
+| `order/order-sdk.js` | `MasterOrderOrderSdk` / `MasterOrderSdk` | 来客 |
+| `core/menu-image-url.js` | `MasterOrderMenuImage` | メニュー画像 URL |
 
 ---
 
 ## スクリプト読み込み順
+
+デプロイ先では `sync-js-sdk` が **フラット** に `js/sdk/*.js` へコピーします（パスは従来どおり）。
 
 ### Staff（店舗 UI）
 
@@ -49,22 +61,9 @@ menu-image-url.js 画像 URL ユーティリティ（R2、SDK 外だが同梱）
 <script src="/js/sdk/core-sdk.js"></script>
 <script src="/js/sdk/menu-image-url.js"></script>
 <script src="/js/sdk/staff-sdk.js"></script>
-<script src="/js/sdk/staff-ui-sdk.js"></script>
-<script src="/js/sdk/staff-claims-sdk.js"></script>
-<script src="/js/sdk/staff-session-mode-sdk.js"></script>
-<script src="/js/sdk/staff-qr-sdk.js"></script>
-<script src="/js/sdk/staff-firestore-sdk.js"></script>
-<script src="/js/sdk/staff-firestore-runtime-sdk.js"></script>
-<script src="/js/sdk/staff-kitei-table-sdk.js"></script>
-<script src="/js/sdk/staff-dashboard-sdk.js"></script>
-<script src="/js/sdk/staff-notifications-sdk.js"></script>
-<script src="/js/sdk/staff-user-sdk.js"></script>
+<!-- … staff/*.js を staff/README.md の順で … -->
 <script src="/js/sdk/staff-app-wiring.js"></script>
 ```
-
-`client-sdk.js` は **読み込まなくてよい**（`staff-sdk.js` が `MasterOrderClientSdk` もエクスポート）。  
-`staff-user-sdk.js` は `staff-notifications-sdk.js` の直後（プロフィール・トップバー chrome）。  
-`staff-app-wiring.js` は Staff 専用モジュールの **最後** に置く（`createStaffAppServices` が他 SDK を束ねる）。
 
 ### Order（来客 UI）
 
@@ -77,12 +76,43 @@ menu-image-url.js 画像 URL ユーティリティ（R2、SDK 外だが同梱）
 <script src="/js/sdk/menu-image-url.js"></script>
 ```
 
-| ファイル | グローバル | 用途 |
-|----------|------------|------|
-| `guest-ui-i18n.js` | `MasterOrderGuestUiI18n` | 来客 UI 文言（ja/en/zh/ko） |
-| `guest-order-ui-sdk.js` | `MasterOrderGuestOrderUiSdk` | カート・履歴・言語ピッカー描画 |
+| パス（正本） | グローバル | 用途 |
+|--------------|------------|------|
+| `order/guest-ui-i18n.js` | `MasterOrderGuestUiI18n` | 来客 UI 文言 |
+| `order/guest-order-ui-sdk.js` | `MasterOrderGuestOrderUiSdk` | カート・履歴描画 |
 
 ---
+
+## 開発
+
+```bash
+npm run verify   # core/ order/ staff/ の配置を検証
+```
+
+`sdk-manifest.json` がレイヤとファイル一覧の正本です。MasterOrder monorepo の `sync-js-sdk.ps1` がこれを読み、Order / Staff / Client へフラットコピーします。
+
+---
+
+## 配置・同期
+
+| 配布先 | バンドル |
+|--------|----------|
+| Order 静的 (`static/js/sdk/`) | core + order |
+| Staff 静的 (`static/staff/js/sdk/`) | core + staff |
+| order-pages (`vendor/js-sdk` submodule) | core + order（assemble） |
+
+```powershell
+# MasterOrder monorepo
+.\scripts\sync-js-sdk.ps1
+```
+
+---
+
+## 関連ドキュメント
+
+- [core/README.md](./core/README.md)
+- [order/README.md](./order/README.md)
+- [staff/README.md](./staff/README.md)
 
 ## クイックスタート
 

@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "layers": {
+    "core": {
+      "label": "Core",
+      "description": "HTTP / SSE / routes / shared utilities",
+      "files": [
+        "api-routes.js",
+        "core-sdk.js",
+        "consumption-tax.js",
+        "menu-image-url.js",
+        "menu-customer-text.js",
+        "text-input-ui.js"
+      ]
+    },
+    "order": {
+      "label": "Order",
+      "description": "Guest order session, menu, cart, QR",
+      "files": [
+        "order-sdk.js",
+        "guest-ui-i18n.js",
+        "guest-order-ui-sdk.js",
+        "guest-firestore-sdk.js"
+      ]
+    },
+    "staff": {
+      "label": "Staff",
+      "description": "Staff dashboard, sessions, kitchen, Firestore helpers",
+      "files": [
+        "staff-sdk.js",
+        "client-sdk.js",
+        "staff-inventory-sdk.js",
+        "staff-ui-sdk.js",
+        "staff-claims-sdk.js",
+        "staff-session-mode-sdk.js",
+        "staff-qr-sdk.js",
+        "staff-firestore-sdk.js",
+        "staff-firestore-runtime-sdk.js",
+        "staff-session-list-sdk.js",
+        "staff-kitei-table-sdk.js",
+        "staff-dashboard-sdk.js",
+        "staff-notifications-sdk.js",
+        "staff-email-auth-sdk.js",
+        "staff-user-sdk.js",
+        "staff-app-wiring.js"
+      ]
+    }
+  },
+  "bundles": {
+    "order": ["core", "order"],
+    "staff": ["core", "staff"]
+  }
+}
