@@ -211,6 +211,9 @@
         if (parsed.origin !== 'https://guest.invalid' || parsed.pathname.indexOf('..') >= 0) {
             return false;
         }
+        if (parsed.pathname === '/') {
+            return true;
+        }
         return SAFE_GUEST_RELATIVE_PATH_RE.test(parsed.pathname);
     }
 
@@ -407,6 +410,10 @@
         var raw = String(pathOrUrl || '').trim();
         if (!raw) {
             return false;
+        }
+        if (raw === '/' || raw === '/index.html') {
+            location.replace(raw);
+            return true;
         }
         if (raw.charAt(0) === '/' && isConnectShopRelativePath(raw)) {
             location.replace(raw);
