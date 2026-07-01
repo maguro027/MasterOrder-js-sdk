@@ -9,7 +9,7 @@
 (function (global) {
     'use strict';
 
-    var SDK_VERSION = '1.2.1';
+    var SDK_VERSION = '1.2.2';
 
     var STAFF_SESSION_UPDATED_EVENT = 'masterorder:staff-session-updated';
 
@@ -53,8 +53,13 @@
      */
     function createStaffSdk(options) {
         var apiBaseUrl = options.apiBaseUrl;
+        var fallbackBases = options.fallbackBaseUrls;
+        if (!fallbackBases && typeof window !== 'undefined' && window._serverBaseFallbacks) {
+            fallbackBases = window._serverBaseFallbacks;
+        }
         var http = core.createHttpClient({
             baseUrl: apiBaseUrl,
+            fallbackBaseUrls: fallbackBases,
             getAccessToken: options.getIdToken,
             onUnauthorized: options.onUnauthorized
         });
@@ -66,19 +71,92 @@
 
         var profileApi = core.createProfileApi(http, authPaths);
         var accountStateApi = core.createAccountStateApi(http, authPaths);
+        var piiCache = global.MasterOrderStaffPiiLocalCache;
+        var getFirebaseUid = typeof options.getFirebaseUid === 'function'
+            ? options.getFirebaseUid
+            : function () { return options.firebaseUid || null; };
+
+        function cacheProfile(profile) {
+            var uid = getFirebaseUid();
+            if (uid && piiCache && profile) {
+                piiCache.saveProfile(uid, profile);
+            }
+            return profile;
+        }
+
+        function getMyProfileWithCache() {
+            var uid = getFirebaseUid();
+            return profileApi.getMyProfile()
+                .then(cacheProfile)
+                .catch(function (err) {
+                    if (uid && piiCache) {
+                        var cached = piiCache.loadProfile(uid);
+                        if (cached) {
+                            return cached;
+                        }
+                    }
+                    return Promise.reject(err);
+                });
+        }
+
+        function wrapProfileMutation(fn) {
+            return function () {
+                var args = arguments;
+                return fn.apply(profileApi, args).then(cacheProfile);
+            };
+        }
+
+        function wrapSseHandler(handler) {
+            return function (event) {
+                var uid = getFirebaseUid();
+                if (uid && piiCache && event) {
+                    piiCache.handleRealtimeEvent(uid, event.data);
+                }
+                if (typeof handler === 'function') {
+                    handler(event);
+                }
+            };
+        }
+
+        function listShopMembersWithCache(shopId) {
+            var uid = getFirebaseUid();
+            return http.get(staffPaths.members(shopId))
+                .then(function (members) {
+                    var list = Array.isArray(members) ? members : [];
+                    if (uid && piiCache) {
+                        piiCache.saveShopMembers(uid, shopId, list);
+                    }
+                    return list;
+                })
+                .catch(function (err) {
+                    if (uid && piiCache) {
+                        var cached = piiCache.loadShopMembers(uid, shopId);
+                        if (cached) {
+                            return cached;
+                        }
+                    }
+                    return Promise.reject(err);
+                });
+        }
 
         return {
             api: http.request,
+            clearLocalPiiCache: function () {
+                var uid = getFirebaseUid();
+                if (uid && piiCache) {
+                    piiCache.clearAll(uid);
+                }
+            },
             getMyShops: function () {
                 return http.get(staffPaths.myShops());
             },
             createShop: function (payload) {
                 return http.post(staffPaths.createShop(), payload);
             },
-            getMyProfile: profileApi.getMyProfile,
-            updateMyProfile: profileApi.updateMyProfile,
-            setMyPublicId: profileApi.setMyPublicId,
-            saveProfile: profileApi.saveProfile,
+            getMyProfile: getMyProfileWithCache,
+            updateMyProfile: wrapProfileMutation(profileApi.updateMyProfile),
+            setMyPublicId: wrapProfileMutation(profileApi.setMyPublicId),
+            saveProfile: wrapProfileMutation(profileApi.saveProfile),
             getMyAccountStatus: accountStateApi.getMyAccountStatus,
             reportPasswordResetCompleted: accountStateApi.reportPasswordResetCompleted,
             syncFirebaseClaims: function () {
@@ -206,7 +284,7 @@
                         return issueSseTicket(http, shopId);
                     },
                     eventName: 'order-update',
-                    onMessage: h.onOrderUpdate,
+                    onMessage: wrapSseHandler(h.onOrderUpdate),
                     onOpen: h.onOpen,
                     onError: h.onError
                 });
@@ -220,11 +298,11 @@
                         return issueSseTicket(http, shopId);
                     },
                     eventName: 'order-update',
-                    onMessage: function (event) {
+                    onMessage: wrapSseHandler(function (event) {
                         if (typeof realtimeHandler === 'function') {
                             void realtimeHandler(event);
                         }
-                    },
+                    }),
                     onOpen: h.onOpen,
                     onError: h.onError
                 });
@@ -235,9 +313,7 @@
             getMyPermissions: function (shopId) {
                 return http.get(staffPaths.permissionsMe(shopId));
             },
-            listShopMembers: function (shopId) {
-                return http.get(staffPaths.members(shopId));
-            },
+            listShopMembers: listShopMembersWithCache,
             inviteMemberByPublicId: function (shopId, publicId, roleType) {
                 return http.post(staffPaths.inviteMember(shopId), {
                     publicId: publicId,
@@ -305,6 +381,27 @@
             deleteMenu: function (menuId) {
                 return http.delete(staffPaths.deleteMenu(menuId));
             },
+            getCatalogUnpublished: function (shopId) {
+                return http.get(staffPaths.catalogUnpublished(shopId));
+            },
+            publishCatalog: function (shopId, target) {
+                return http.post(staffPaths.publishCatalog(shopId, target || 'all'), {});
+            },
+            getShopSubscribe: function (shopId) {
+                return http.get(staffPaths.shopSubscribe(shopId));
+            },
+            createBillingCheckoutSession: function (shopId, payload) {
+                return http.post(staffPaths.billingCheckoutSession(shopId), payload || {});
+            },
+            getBillingAddonQuote: function (shopId, checkoutType, quantity) {
+                return http.get(core.withQuery(staffPaths.billingAddonQuote(shopId), {
+                    checkoutType: checkoutType,
+                    quantity: quantity
+                }));
+            },
+            createBillingPortalSession: function (shopId) {
+                return http.post(staffPaths.billingPortalSession(shopId), {});
+            },
             getToppingGroupsByShop: function (shopId) {
                 return http.get(staffPaths.toppingGroups(shopId));
             },
@@ -351,6 +448,18 @@
             },
             getShopMenuCategories: function (shopId) {
                 return http.get(staffPaths.menuCategories(shopId));
+            },
+            createMenuCategory: function (shopId, payload) {
+                return http.post(staffPaths.createMenuCategory(shopId), payload || {});
+            },
+            updateMenuCategory: function (categoryId, payload) {
+                return http.request(staffPaths.updateMenuCategory(categoryId), {
+                    method: 'PUT',
+                    body: JSON.stringify(payload || {})
+                });
+            },
+            deleteMenuCategory: function (categoryId, shopId) {
+                return http.delete(core.withQuery(staffPaths.deleteMenuCategory(categoryId), { shopId: shopId }));
             },
             getRecommendMenus: function (shopId) {
                 return http.get(staffPaths.recommendMenus(shopId))

@@ -2,7 +2,8 @@
  * MasterOrder HTTP API ルート定義（正本）。
  *
  * ## アーキテクチャ
- * - ブラウザ（スタッフ Client / 来客 Order）は **接続先ノードの Server API のみ** を呼ぶ。
+ * - 来客メニュー read（order-bundle / menus/search / topping catalog）は **Gate Worker**（`window._gatePublicBase`）。
+ * - セッション・注文 POST は **Server API**（`window._serverBase`）。
  * - Firestore / D1 / KV への直接接続は **Server プロセスだけ**（リスナー・暖機・永続化）。
  * - 各 Server ノードは SSE 購読店舗について in-memory キャッシュ（アクティブセッション等）を持ち、
  *   GET /sessions/active 等は可能な限りキャッシュを返す（Firestore 全件 GET を避ける）。
@@ -114,10 +115,32 @@
                 audience: 'staff'
             },
             menuCategories: { method: 'GET', path: '/menu-categories/shops/:shopId', audience: 'staff' },
+            createMenuCategory: { method: 'POST', path: '/menu-categories/shops/:shopId', audience: 'staff' },
+            updateMenuCategory: { method: 'PUT', path: '/menu-categories/:categoryId', audience: 'staff' },
+            deleteMenuCategory: { method: 'DELETE', path: '/menu-categories/:categoryId', audience: 'staff', note: 'shopId' },
             recommendMenus: { method: 'GET', path: '/shops/:shopId/recommend-menus', audience: 'staff' },
             updateRecommendMenus: { method: 'PUT', path: '/shops/:shopId/recommend-menus', audience: 'staff' },
             recommendMenuBanner: { method: 'POST', path: '/shops/:shopId/recommend-menus/:menuId/banner', audience: 'staff' },
-            deleteRecommendMenuBanner: { method: 'DELETE', path: '/shops/:shopId/recommend-menus/:menuId/banner', audience: 'staff' }
+            deleteRecommendMenuBanner: { method: 'DELETE', path: '/shops/:shopId/recommend-menus/:menuId/banner', audience: 'staff' },
+            catalogUnpublished: { method: 'GET', path: '/shops/:shopId/catalog/unpublished', audience: 'staff' },
+            publishCatalog: { method: 'POST', path: '/shops/:shopId/catalog/publish', audience: 'staff' },
+            shopSubscribe: { method: 'GET', path: '/shops/:shopId/subscribe', audience: 'staff' },
+            billingCheckoutSession: {
+                method: 'POST',
+                path: '/shops/:shopId/billing/checkout-session',
+                audience: 'staff'
+            },
+            billingAddonQuote: {
+                method: 'GET',
+                path: '/shops/:shopId/billing/addon-quote',
+                audience: 'staff',
+                note: 'checkoutType, quantity'
+            },
+            billingPortalSession: {
+                method: 'POST',
+                path: '/shops/:shopId/billing/portal-session',
+                audience: 'staff'
+            }
         },
 
         auth: {
@@ -138,6 +161,13 @@
             orderToppingCatalog: { method: 'GET', path: '/topping-groups/shops/:shopId/order-catalog', audience: 'guest' },
             orderBundle: { method: 'GET', path: '/guest/shops/:shopId/order-bundle', audience: 'guest' },
             recommendMenus: { method: 'GET', path: '/shops/:shopId/recommend-menus', audience: 'guest' }
+        },
+
+        gateGuest: {
+            menuSearch: { method: 'GET', path: '/v1/guest/menus/search', audience: 'guest', note: 'Gate Worker KV catalog read' },
+            toppingGroupsForMenu: { method: 'GET', path: '/v1/guest/topping-groups/menus/:menuId', audience: 'guest' },
+            orderToppingCatalog: { method: 'GET', path: '/v1/guest/topping-groups/shops/:shopId/order-catalog', audience: 'guest' },
+            orderBundle: { method: 'GET', path: '/v1/guest/shops/:shopId/order-bundle', audience: 'guest' }
         }
     };
 
@@ -232,6 +262,9 @@
                 return '/inventory/shops/' + enc(shopId) + '/inventory/reset-to-initial';
             },
             menuCategories: function (shopId) { return '/menu-categories/shops/' + enc(shopId); },
+            createMenuCategory: function (shopId) { return '/menu-categories/shops/' + enc(shopId); },
+            updateMenuCategory: function (categoryId) { return '/menu-categories/' + enc(categoryId); },
+            deleteMenuCategory: function (categoryId) { return '/menu-categories/' + enc(categoryId); },
             recommendMenus: function (shopId) { return '/shops/' + enc(shopId) + '/recommend-menus'; },
             updateRecommendMenus: function (shopId) { return '/shops/' + enc(shopId) + '/recommend-menus'; },
             recommendMenuBanner: function (shopId, menuId) {
@@ -239,6 +272,25 @@
             },
             deleteRecommendMenuBanner: function (shopId, menuId) {
                 return '/shops/' + enc(shopId) + '/recommend-menus/' + enc(menuId) + '/banner';
+            },
+            catalogUnpublished: function (shopId) {
+                return '/shops/' + enc(shopId) + '/catalog/unpublished';
+            },
+            publishCatalog: function (shopId, target) {
+                var query = target ? '?target=' + enc(target) : '';
+                return '/shops/' + enc(shopId) + '/catalog/publish' + query;
+            },
+            shopSubscribe: function (shopId) {
+                return '/shops/' + enc(shopId) + '/subscribe';
+            },
+            billingCheckoutSession: function (shopId) {
+                return '/shops/' + enc(shopId) + '/billing/checkout-session';
+            },
+            billingAddonQuote: function (shopId) {
+                return '/shops/' + enc(shopId) + '/billing/addon-quote';
+            },
+            billingPortalSession: function (shopId) {
+                return '/shops/' + enc(shopId) + '/billing/portal-session';
             }
         },
         auth: {
@@ -258,6 +310,12 @@
             orderToppingCatalog: function (shopId) { return '/topping-groups/shops/' + enc(shopId) + '/order-catalog'; },
             orderBundle: function (shopId) { return '/guest/shops/' + enc(shopId) + '/order-bundle'; },
             recommendMenus: function (shopId) { return '/shops/' + enc(shopId) + '/recommend-menus'; }
+        },
+        gateGuest: {
+            menuSearch: function () { return '/v1/guest/menus/search'; },
+            toppingGroupsForMenu: function (menuId) { return '/v1/guest/topping-groups/menus/' + enc(menuId); },
+            orderToppingCatalog: function (shopId) { return '/v1/guest/topping-groups/shops/' + enc(shopId) + '/order-catalog'; },
+            orderBundle: function (shopId) { return '/v1/guest/shops/' + enc(shopId) + '/order-bundle'; }
         }
     };
 
