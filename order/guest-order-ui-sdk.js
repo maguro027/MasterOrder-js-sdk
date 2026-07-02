@@ -136,6 +136,22 @@
         }
 
         var frag = global.document.createDocumentFragment();
+        var priceNotice = String(opts.priceNotice || '').trim();
+        if (priceNotice) {
+            var notice = global.document.createElement('div');
+            notice.className = 'cart-price-notice';
+            notice.setAttribute('role', 'status');
+            notice.style.margin = '0 0 12px';
+            notice.style.padding = '10px 12px';
+            notice.style.borderRadius = '10px';
+            notice.style.background = 'rgba(240, 192, 64, 0.14)';
+            notice.style.border = '1px solid rgba(240, 192, 64, 0.45)';
+            notice.style.color = '#f0c040';
+            notice.style.fontSize = '13px';
+            notice.style.lineHeight = '1.5';
+            notice.textContent = priceNotice;
+            frag.appendChild(notice);
+        }
         cart.forEach(function (item, index) {
             var card = global.document.createElement('div');
             card.className = 'list-card';
@@ -268,31 +284,69 @@
         }
 
         var lang = resolveLang(orderSdk, opts.lang);
+        var sendingStatus = orderSdk && orderSdk.ORDER_SEND_STATUS
+            ? orderSdk.ORDER_SEND_STATUS.SENDING
+            : 'sending';
         var frag = global.document.createDocumentFragment();
         history.slice().reverse().forEach(function (order) {
-            var row = global.document.createElement('div');
-            row.style.display = 'flex';
-            row.style.justifyContent = 'space-between';
-            row.style.marginBottom = '8px';
-            row.style.fontSize = '14px';
-            row.style.borderBottom = '1px solid #333';
-            row.style.paddingBottom = '8px';
+            var card = global.document.createElement('div');
+            card.className = 'order-history-card';
 
-            var left = global.document.createElement('span');
+            var body = global.document.createElement('div');
+            body.className = 'order-history-card-body';
+
+            var left = global.document.createElement('div');
+            left.className = 'order-history-card-lines';
             var lines = [];
             if (orderSdk && typeof orderSdk.formatOrderHistoryLines === 'function') {
                 lines = orderSdk.formatOrderHistoryLines(order, opts.menus || [], { lang: lang });
             } else if (Array.isArray(order.lines)) {
                 lines = order.lines;
             }
-            left.textContent = ((order.timestamp || '') + ' ' + lines.join(' / ')).trim();
+            var time = global.document.createElement('div');
+            time.className = 'order-history-card-time';
+            time.textContent = String(order.timestamp || '').trim();
+            left.appendChild(time);
+            if (lines.length) {
+                var detail = global.document.createElement('div');
+                detail.className = 'order-history-card-detail';
+                detail.textContent = lines.join(' / ');
+                left.appendChild(detail);
+            }
 
-            var right = global.document.createElement('span');
-            right.textContent = '¥' + Number(order.total || 0).toLocaleString();
+            var right = global.document.createElement('div');
+            right.className = 'order-history-card-total';
+            var displayTotal = order.total;
+            if (orderSdk && typeof orderSdk.resolveOrderHistoryDisplayTotal === 'function') {
+                displayTotal = orderSdk.resolveOrderHistoryDisplayTotal(order);
+            }
+            right.textContent = '¥' + Number(displayTotal || 0).toLocaleString();
 
-            row.appendChild(left);
-            row.appendChild(right);
-            frag.appendChild(row);
+            body.appendChild(left);
+            body.appendChild(right);
+            card.appendChild(body);
+
+            var isSending = order.sendStatus === sendingStatus;
+            if (isSending) {
+                var overlay = global.document.createElement('div');
+                overlay.className = 'order-history-sending-overlay';
+                overlay.setAttribute('aria-live', 'polite');
+                overlay.setAttribute('aria-busy', 'true');
+
+                var spinner = global.document.createElement('div');
+                spinner.className = 'order-history-spinner';
+                spinner.setAttribute('aria-hidden', 'true');
+
+                var label = global.document.createElement('p');
+                label.className = 'order-history-sending-label';
+                label.textContent = t(orderSdk, 'sendOrderSendingCard', null, opts.lang);
+
+                overlay.appendChild(spinner);
+                overlay.appendChild(label);
+                card.appendChild(overlay);
+            }
+
+            frag.appendChild(card);
         });
 
         list.appendChild(frag);

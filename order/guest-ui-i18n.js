@@ -59,7 +59,8 @@
             selectOne: '1つ選択',
             selectUpTo: '最大{max}つまで選択',
             cartAdded: '{name} をカートに追加しました',
-            waitMenuLoad: 'メニューの読み込みが完了するまでお待ちください'
+            waitMenuLoad: 'メニューの読み込みが完了するまでお待ちください',
+            cartPriceChanged: '注意：一部の商品の価格が変更されました。内容をご確認ください。'
         },
         en: {
             navMenu: 'Menu',
@@ -114,7 +115,8 @@
             selectOne: 'Choose one',
             selectUpTo: 'Choose up to {max}',
             cartAdded: 'Added {name} to cart',
-            waitMenuLoad: 'Please wait until the menu has finished loading'
+            waitMenuLoad: 'Please wait until the menu has finished loading',
+            cartPriceChanged: 'Note: prices changed for some items. Please review your cart.'
         },
         zh: {
             navMenu: '菜单',

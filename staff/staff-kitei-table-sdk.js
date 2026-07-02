@@ -526,6 +526,7 @@
             }
             var tableNo = Number(seat.tableNo || 0);
             var isUsing = String(seat.status || '').toUpperCase() === 'USING';
+            els.qr.hidden = false;
             setFixedQrLoading(els, false, null);
             if (els.qrCaption) {
                 els.qrCaption.textContent = isUsing ? '利用中（固定QR）' : '卓上固定QR';
@@ -535,7 +536,10 @@
                 els.passwd.textContent = 'PASSWD: ' + passPhrase;
             }
             if (typeof opts.applyFixedQrToWrap === 'function') {
-                opts.applyFixedQrToWrap(els.qr, els.qrImg, els.qrCaption, tableNo, passPhrase);
+                var applied = opts.applyFixedQrToWrap(els.qr, els.qrImg, els.qrCaption, tableNo, passPhrase);
+                if (!applied && els.qrCaption && !els.qrCaption.textContent) {
+                    els.qrCaption.textContent = '固定QRを生成できません';
+                }
             }
         }
 
@@ -544,6 +548,7 @@
             if (!els.qr || !seat) {
                 return;
             }
+            els.qr.hidden = false;
             var tableNo = Number(seat.tableNo || 0);
             var passPhrase = resolveTableSeatPassPhrase(seat, null, caches) || seat.passPhrase || null;
             setFixedQrLoading(els, true, null);
@@ -595,6 +600,7 @@
                 }
                 return;
             }
+            setFixedQrLoading(els, false, null);
             els.qr.hidden = false;
             if (els.passwd) {
                 els.passwd.hidden = true;
@@ -604,7 +610,11 @@
                 els.qrCaption.textContent = 'セッションに参加できるQR';
             }
             if (typeof opts.applyJoinQrToWrap === 'function') {
-                opts.applyJoinQrToWrap(els.qr, els.qrImg, els.qrCaption, seat);
+                Promise.resolve(opts.applyJoinQrToWrap(els.qr, els.qrImg, els.qrCaption, seat)).catch(function () {
+                    if (typeof opts.toast === 'function') {
+                        opts.toast('注文QRの表示に失敗しました', 'error');
+                    }
+                });
             }
         }
 
@@ -657,17 +667,6 @@
                 }
 
                 if (isUsing && seat.currentSessionId) {
-                    var joinQrBtn = makeActionListButton(
-                        '注文QRを表示',
-                        'セッションに参加できるQRを表示'
-                    );
-                    joinQrBtn.addEventListener('click', function () {
-                        showJoinQrInActionModal(actionContext);
-                    });
-                    els.list.appendChild(joinQrBtn);
-                }
-
-                if (isUsing && seat.currentSessionId) {
                     var checkoutBtn = document.createElement('button');
                     checkoutBtn.type = 'button';
                     checkoutBtn.className = 'btn-danger-action';
@@ -696,17 +695,6 @@
                         }
                     });
                     els.list.appendChild(detailBtn);
-
-                    var connectBtn = document.createElement('button');
-                    connectBtn.type = 'button';
-                    connectBtn.className = 'table-seat-action-connect-btn';
-                    connectBtn.textContent = 'セッション接続';
-                    connectBtn.addEventListener('click', function () {
-                        if (typeof opts.onConnectSession === 'function') {
-                            opts.onConnectSession(actionContext || seat);
-                        }
-                    });
-                    els.list.appendChild(connectBtn);
                 }
             }
             if (els.footer && els.connectBtn) {
@@ -723,7 +711,11 @@
                 }
             }
             els.modal.classList.add('show');
-            void loadAndShowFixedQrInActionModal(actionContext);
+            if (isUsing && seat.currentSessionId) {
+                showJoinQrInActionModal(actionContext);
+            } else {
+                void loadAndShowFixedQrInActionModal(actionContext);
+            }
         }
 
         function handleCardActivate(card) {

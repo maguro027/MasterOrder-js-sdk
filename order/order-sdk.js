@@ -21,6 +21,7 @@
         throw new Error('MasterOrderApiRoutes is required. Load api-routes.js before order-sdk.js');
     }
     const guestPaths = apiRouteRegistry.paths.guest;
+    const gateGuestPaths = apiRouteRegistry.paths.gateGuest;
     const authPaths = apiRouteRegistry.paths.auth || apiRouteRegistry.paths.staff;
 
     const DEFAULT_RESYNC_INTERVAL_MS = 20000;
@@ -37,6 +38,8 @@
     };
     const LS_SESSION_ID = 'mo_sessionId';
     const LS_PIN = 'mo_pin';
+    const LS_SESSION_SHOP_SLUG = 'mo_sessionShopSlug';
+    const LS_SESSION_SHOP_ID = 'mo_sessionShopId';
     const JOIN_SESSION_PARAM = 'sessionId';
     const JOIN_PIN_PARAM = 'pin';
     const JOIN_TOKEN_PARAM = 'join';
@@ -80,13 +83,38 @@
         'mo_logo_url',
         'mo_has_custom_css'
     ];
+    /** @deprecated 来客 URL は /Shop/{slug}/ のみ。後方互換の定数（空パスへフォールバック用） */
+    const GUEST_SCAN_PATH = '';
+    const GUEST_SHOP_PATH_PREFIX = '/Shop';
+    /** Cloudflare Pages 等で slug ルートと競合しないよう予約（先頭パスセグメント） */
+    const GUEST_RESERVED_PATH_SEGMENTS = {
+        scan: true,
+        shop: true,
+        connect: true,
+        view: true,
+        index2: true,
+        index: true,
+        js: true,
+        orderpages: true,
+        'guest-scan': true,
+        'guest-shop': true,
+        '404': true,
+        favicon: true,
+        sw: true
+    };
 
     function isFixedQrConnectEntryPath() {
         if (typeof location === 'undefined') {
             return false;
         }
-        var path = String(location.pathname || '/').replace(/\/+$/, '') || '/';
-        return path === '/connect';
+        var route = parseGuestRoute(location.pathname || '/');
+        if (route.type !== 'shop-slug') {
+            return false;
+        }
+        var params = new URLSearchParams(location.search || '');
+        var tableNo = String(params.get(FIXED_QR_TABLE_PARAM) || params.get('table') || '').trim();
+        var passPhrase = String(params.get(FIXED_QR_PASS_PARAM) || params.get('passPhrase') || '').trim();
+        return /^\d+$/.test(tableNo) && passPhrase.length > 0 && passPhrase.length <= 128;
     }
 
     function stripLegacyMoQueryParams(options) {
@@ -95,6 +123,15 @@
         }
         options = options || {};
         var params = new URLSearchParams(location.search || '');
+        var joinId = sanitizeGuestSessionId(
+            params.get('id') || params.get(JOIN_SESSION_PARAM) || ''
+        );
+        var joinPin = sanitizeGuestJoinPin(
+            params.get('pass') || params.get(JOIN_PIN_PARAM) || ''
+        );
+        if (joinId && joinPin) {
+            stashJoinCredentialsForRoute(joinId, joinPin);
+        }
         var changed = false;
         var keys = LEGACY_GUEST_QUERY_KEYS.concat(CREDENTIAL_QUERY_KEYS);
         if (!options.force && isFixedQrConnectEntryPath()) {
@@ -155,12 +192,12 @@
     }
 
     var GUEST_SESSION_ID_RE = /^[ABEFGHJKMNPQRTUVWXYZabefghjkmnpqrtuvwxyz]{10}$/;
-    var GUEST_JOIN_PIN_RE = /^[0-9]{7}$/;
-    var GUEST_LEGACY_PIN_RE = /^[A-Z0-9]{4,8}$/;
+    var GUEST_PIN_NEW_RE = /^[0-9A-Z]{8}$/;
+    var GUEST_PIN_LEGACY_NUMERIC_RE = /^[0-9]{7}$/;
     var SAFE_GUEST_RELATIVE_PATH_RE = /^\/[A-Za-z0-9][A-Za-z0-9._\-/]*$/;
     var SAFE_CONNECT_SLUG_RE = /^[A-Za-z0-9][A-Za-z0-9._\-]*$/;
     var KNOWN_TEMPLATE_ENTRY_PATHS = {
-        index2: '/index2.html',
+        index2: '/index2/',
         original: '/index.html',
         index: '/index.html',
         'cursor-1': '/OrderPages/Cursor-1/index.html',
@@ -174,14 +211,36 @@
 
     function sanitizeGuestJoinPin(pin) {
         var normalized = normalizeJoinPin(pin);
-        if (GUEST_JOIN_PIN_RE.test(normalized)) {
+        if (GUEST_PIN_NEW_RE.test(normalized)) {
             return normalized;
         }
-        if (GUEST_LEGACY_PIN_RE.test(normalized)) {
+        if (GUEST_PIN_LEGACY_NUMERIC_RE.test(normalized)) {
             return normalized;
         }
         return '';
     }
+
+    function migrateSessionCredentialsFromLocalStorage() {
+        if (typeof localStorage === 'undefined' || typeof sessionStorage === 'undefined') {
+            return;
+        }
+        var keys = [LS_SESSION_ID, LS_PIN, LS_SESSION_SHOP_SLUG, LS_SESSION_SHOP_ID];
+        var hasLocal = keys.some(function (k) {
+            var v = localStorage.getItem(k);
+            return v != null && String(v).trim() !== '';
+        });
+        if (!hasLocal) {
+            return;
+        }
+        keys.forEach(function (k) {
+            var v = localStorage.getItem(k);
+            if (v != null && String(v).trim() !== '' && !sessionStorage.getItem(k)) {
+                sessionStorage.setItem(k, v);
+            }
+            localStorage.removeItem(k);
+        });
+    }
+    migrateSessionCredentialsFromLocalStorage();
 
     function sanitizeConnectSlug(slug) {
         var raw = String(slug || '').trim();
@@ -274,6 +333,9 @@
         if (!raw) {
             return false;
         }
+        if (isSameGuestNavigationTarget(raw)) {
+            return false;
+        }
         var resolved;
         if (raw.charAt(0) === '/') {
             if (!isSafeSameOriginRelativePath(raw)) {
@@ -319,32 +381,127 @@
         return cleaned;
     }
 
+    function normalizeGuestRouteSlugSegment(segment) {
+        var raw = String(segment || '').trim();
+        if (!raw) {
+            return '';
+        }
+        try {
+            return decodeURIComponent(raw);
+        } catch (_) {
+            return raw;
+        }
+    }
+
+    function isGuestReservedPathSegment(segment) {
+        var key = String(segment || '').trim().toLowerCase();
+        if (!key) {
+            return true;
+        }
+        if (GUEST_RESERVED_PATH_SEGMENTS[key]) {
+            return true;
+        }
+        return key.endsWith('.html') || key.endsWith('.js') || key.endsWith('.ico')
+            || key.endsWith('.svg') || key.endsWith('.webp');
+    }
+
+    function guestSlugMatches(routeSlug, expectedSlug) {
+        var route = normalizeGuestRouteSlugSegment(routeSlug);
+        var expected = displayPathSlug(expectedSlug) || String(expectedSlug || '').trim();
+        if (!route || !expected) {
+            return false;
+        }
+        if (route === expected) {
+            return true;
+        }
+        return displayPathSlug(route) === displayPathSlug(expected);
+    }
+
     function parseGuestRoute(pathname) {
         var parts = String(pathname || '/').split('/').filter(Boolean);
         if (parts.length === 0) {
             return { type: 'root' };
         }
-        if (parts[0] === 'scan') {
-            return { type: 'scan' };
+        if (String(parts[0]).toLowerCase() === 'scan') {
+            return { type: 'removed', removed: 'scan' };
         }
-        if (parts[0] === 'connect') {
-            if (parts.length >= 2) {
-                try {
-                    return { type: 'connect-shop', shopSlug: decodeURIComponent(parts[1]) };
-                } catch (_) {
-                    return { type: 'connect-shop', shopSlug: parts[1] };
-                }
+        if (String(parts[0]).toLowerCase() === 'shop' && parts.length >= 2) {
+            if (parts.length >= 3 && String(parts[2]).toLowerCase() === 'scan') {
+                return { type: 'shop-slug', shopSlug: normalizeGuestRouteSlugSegment(parts[1]) };
             }
-            return { type: 'connect' };
+            return { type: 'shop-slug', shopSlug: normalizeGuestRouteSlugSegment(parts[1]) };
         }
-        if (parts[0] === 'view' && parts.length >= 2) {
-            try {
-                return { type: 'view-shop', shopSlug: decodeURIComponent(parts[1]) };
-            } catch (_) {
-                return { type: 'view-shop', shopSlug: parts[1] };
-            }
+        if (parts.length === 2 && String(parts[1]).toLowerCase() === 'scan'
+                && !isGuestReservedPathSegment(parts[0])) {
+            return { type: 'shop-slug', shopSlug: normalizeGuestRouteSlugSegment(parts[0]) };
+        }
+        if (parts.length === 1 && !isGuestReservedPathSegment(parts[0])) {
+            return { type: 'shop-slug', shopSlug: normalizeGuestRouteSlugSegment(parts[0]) };
         }
         return { type: 'other' };
+    }
+
+    function isShopScopedGuestRoute(route) {
+        return !!route && route.type === 'shop-slug';
+    }
+
+    function guestRouteShopSlug(route) {
+        if (!isShopScopedGuestRoute(route)) {
+            return '';
+        }
+        return route.shopSlug || '';
+    }
+
+    function buildShopScopedScanPath(shopSlug) {
+        return buildShopScopedGuestPath(shopSlug);
+    }
+
+    function buildShopScopedGuestPath(shopSlug) {
+        var slug = displayPathSlug(shopSlug) || String(shopSlug || '').trim();
+        if (!slug) {
+            return '';
+        }
+        return GUEST_SHOP_PATH_PREFIX + '/' + encodeURIComponent(slug) + '/';
+    }
+
+    function buildShopScopedGuestUrl(shopSlug, sessionId, pin) {
+        var path = buildShopScopedGuestPath(shopSlug);
+        if (!path) {
+            return '';
+        }
+        var id = sanitizeGuestSessionId(sessionId);
+        var normalizedPin = sanitizeGuestJoinPin(pin);
+        if (!id || !normalizedPin) {
+            return path;
+        }
+        var params = new URLSearchParams();
+        params.set('id', id);
+        params.set('pass', normalizedPin);
+        return path + '?' + params.toString();
+    }
+
+    function buildShopScopedScanUrl(shopSlug, sessionId, pin) {
+        return buildShopScopedGuestUrl(shopSlug, sessionId, pin);
+    }
+
+    function resolveShopPublicSlug(detail, shopIdHint) {
+        if (!detail || typeof detail !== 'object') {
+            detail = {};
+        }
+        var raw = detail.raw && typeof detail.raw === 'object' ? detail.raw : {};
+        var fromDetail = (detail.shopSlug || raw.shopSlug || detail.urlSlug || raw.urlSlug || '').trim();
+        if (fromDetail) {
+            return displayPathSlug(fromDetail) || fromDetail;
+        }
+        return '';
+    }
+
+    function buildShopPublicUrl(shopSlug) {
+        var slug = displayPathSlug(shopSlug) || String(shopSlug || '').trim();
+        if (!slug) {
+            return '';
+        }
+        return GUEST_SHOP_PATH_PREFIX + '/' + encodeURIComponent(slug) + '/';
     }
 
     function resolveConnectSlug(detail) {
@@ -399,10 +556,42 @@
         return /^\/connect\/[^/\\?#]+/.test(pathOnly);
     }
 
-    /**
-     * ゲスト接続後の店舗メニュー遷移。/connect/{slug} は従来どおり location.replace を使う
-     * （safeLocationReplace だけだと非 ASCII スラッグ等で遷移に失敗することがある）。
-     */
+    function normalizeGuestPathname(pathname) {
+        var path = String(pathname || '/').split('?')[0].split('#')[0].replace(/\/+$/, '') || '/';
+        if (path === '/index.html') {
+            return '/';
+        }
+        if (path === '/index2' || path === '/index2.html') {
+            return '/index2';
+        }
+        var route = parseGuestRoute(path);
+        if (route.type === 'shop-slug' && route.shopSlug) {
+            return buildShopPublicUrl(route.shopSlug).replace(/\/+$/, '');
+        }
+        return path;
+    }
+
+    function isSameGuestNavigationTarget(pathOrUrl) {
+        if (typeof location === 'undefined') {
+            return false;
+        }
+        var raw = String(pathOrUrl || '').trim();
+        if (!raw) {
+            return false;
+        }
+        var targetPath;
+        if (raw.charAt(0) === '/') {
+            targetPath = raw.split('?')[0].split('#')[0];
+        } else {
+            try {
+                targetPath = new URL(raw, location.origin).pathname;
+            } catch (_) {
+                return false;
+            }
+        }
+        return normalizeGuestPathname(location.pathname) === normalizeGuestPathname(targetPath);
+    }
+
     function guestLocationReplace(pathOrUrl) {
         if (typeof location === 'undefined') {
             return false;
@@ -411,23 +600,14 @@
         if (!raw) {
             return false;
         }
-        if (raw === '/' || raw === '/index.html') {
-            location.replace(raw);
-            return true;
-        }
-        if (raw.charAt(0) === '/' && isConnectShopRelativePath(raw)) {
-            location.replace(raw);
-            return true;
+        if (isSameGuestNavigationTarget(raw)) {
+            return false;
         }
         return safeLocationReplace(raw);
     }
 
     function connectShopPath(shopSlug) {
-        var slug = String(shopSlug || '').trim();
-        if (!slug) {
-            return '/scan';
-        }
-        return '/connect/' + encodeURIComponent(slug);
+        return buildShopPublicUrl(shopSlug) || '';
     }
 
     function normalizeRouteSlug(slug) {
@@ -446,6 +626,10 @@
         var route = normalizeRouteSlug(routeSlug);
         if (!route || !detail) {
             return false;
+        }
+        var publicSlug = resolveShopPublicSlug(detail);
+        if (publicSlug && guestSlugMatches(route, publicSlug)) {
+            return true;
         }
         var pathSlug = connectPathSlug(detail);
         var displaySlug = resolveConnectSlug(detail);
@@ -468,6 +652,17 @@
         return '';
     }
 
+    function normalizeGuestTemplateEntryPath(path) {
+        var p = String(path || '').trim();
+        if (!p) {
+            return '';
+        }
+        if (p === '/index2.html' || p === '/index2' || p === '/index2/') {
+            return '/index2/';
+        }
+        return isSafeSameOriginRelativePath(p) ? p : '/index.html';
+    }
+
     function templateEntryPathForShop(shop) {
         if (!shop) {
             return '';
@@ -480,7 +675,7 @@
         if (!path) {
             return '';
         }
-        return isSafeSameOriginRelativePath(path) ? path : '/index.html';
+        return normalizeGuestTemplateEntryPath(path);
     }
 
     function currentGuestShell() {
@@ -495,30 +690,140 @@
         return String(path || '').toLowerCase().indexOf('index2') >= 0 ? 'index2' : 'original';
     }
 
-    function navigateToTemplateIfNeeded(shop, sessionId, pin) {
-        var targetPath = templateEntryPathForShop(shop);
-        if (!targetPath || typeof location === 'undefined') {
+    function isOnCorrectGuestTemplate(detail) {
+        if (!detail || typeof detail !== 'object') {
             return false;
         }
-        var targetShell = templateShellForPath(targetPath);
-        var currentShell = currentGuestShell();
-        if (currentShell && currentShell === targetShell) {
+        if (typeof location !== 'undefined') {
+            var route = parseGuestRoute(location.pathname || '/');
+            var publicSlug = resolveShopPublicSlug(detail);
+            if (route.type === 'shop-slug' && publicSlug && guestSlugMatches(route.shopSlug, publicSlug)) {
+                var targetPath = templateEntryPathForShop({
+                    templateKey: detail.templateKey,
+                    templateEntryPath: detail.templateEntryPath
+                });
+                var targetShell = templateShellForPath(targetPath);
+                var currentShell = currentGuestShell();
+                return !currentShell || currentShell === targetShell;
+            }
+        }
+        var targetPath = templateEntryPathForShop({
+            templateKey: detail.templateKey,
+            templateEntryPath: detail.templateEntryPath
+        });
+        if (!targetPath) {
             return false;
         }
-        safeLocationReplace(targetPath + guestCredentialsQuery(sessionId, pin));
-        return true;
+        return isSameGuestNavigationTarget(targetPath);
     }
 
-    function buildConnectShopUrl(detail, sessionId, pin, shopIdHint) {
+    function stashPendingConnectDetail(detail, pin) {
+        if (typeof sessionStorage === 'undefined' || !detail || typeof detail !== 'object') {
+            return;
+        }
+        var normalizedPin = sanitizeGuestJoinPin(pin || detail.pin);
+        var sessionId = sanitizeGuestSessionId(detail.sessionId);
+        if (!sessionId || !normalizedPin) {
+            return;
+        }
+        try {
+            sessionStorage.setItem('mo_pending_connect_detail', JSON.stringify({
+                sessionId: sessionId,
+                pin: normalizedPin,
+                shopId: detail.shopId != null ? detail.shopId : null,
+                shopName: detail.shopName || '',
+                templateKey: detail.templateKey || '',
+                templateEntryPath: detail.templateEntryPath || ''
+            }));
+        } catch (_) { /* ignore */ }
+    }
+
+    function takePendingConnectDetail() {
+        if (typeof sessionStorage === 'undefined') {
+            return null;
+        }
+        try {
+            var raw = sessionStorage.getItem('mo_pending_connect_detail');
+            sessionStorage.removeItem('mo_pending_connect_detail');
+            if (!raw) {
+                return null;
+            }
+            var parsed = JSON.parse(raw);
+            var sessionId = sanitizeGuestSessionId(parsed && parsed.sessionId);
+            var pin = sanitizeGuestJoinPin(parsed && parsed.pin);
+            if (!sessionId || !pin) {
+                return null;
+            }
+            parsed.sessionId = sessionId;
+            parsed.pin = pin;
+            return parsed;
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function navigateToTemplateIfNeeded(shop, sessionId, pin) {
+        return false;
+    }
+
+    function buildConnectShopUrl(detail, sessionId, pin, shopIdHint, fallbackSlug) {
         if (!detail || typeof detail !== 'object') {
+            detail = {};
+        }
+        var sid = sanitizeGuestSessionId(sessionId || detail.sessionId);
+        var normalizedPin = sanitizeGuestJoinPin(pin || detail.pin);
+        stashJoinCredentialsForRoute(sid, normalizedPin);
+        var publicSlug = resolveShopPublicSlug(detail, shopIdHint);
+        if (!publicSlug) {
+            publicSlug = resolveConnectSlug(detail);
+            if (publicSlug && String(publicSlug).indexOf('shop-') === 0) {
+                publicSlug = '';
+            }
+        }
+        if (!publicSlug && fallbackSlug) {
+            publicSlug = displayPathSlug(fallbackSlug) || String(fallbackSlug).trim();
+        }
+        if (!publicSlug) {
             return '';
         }
-        var shopSlug = connectPathSlug(detail, shopIdHint);
-        if (!shopSlug) {
-            return '';
+        if (sid && normalizedPin) {
+            return buildShopScopedGuestUrl(publicSlug, sid, normalizedPin);
         }
-        stashJoinCredentialsForRoute(sessionId || detail.sessionId, pin || detail.pin);
-        return connectShopPath(shopSlug);
+        return buildShopPublicUrl(publicSlug);
+    }
+
+    function loadGuestReconnectCredentials() {
+        var creds = loadSessionCredentials();
+        var sessionId = creds.sessionId || '';
+        var pin = creds.pin || '';
+        var shopId = creds.shopId;
+        var shopSlug = creds.shopSlug || '';
+        try {
+            var raw = sessionStorage.getItem(SESSION_CONTEXT_KEY);
+            if (raw) {
+                var parsed = JSON.parse(raw);
+                if (parsed && typeof parsed === 'object') {
+                    if (!sessionId) {
+                        sessionId = sanitizeGuestSessionId(parsed.sessionId) || '';
+                    }
+                    if (!pin) {
+                        pin = sanitizeGuestJoinPin(parsed.pin) || '';
+                    }
+                    if (shopId == null && parsed.shopId != null) {
+                        shopId = Number(parsed.shopId);
+                    }
+                    if (!shopSlug) {
+                        shopSlug = String(parsed.shopSlug || '').trim();
+                    }
+                }
+            }
+        } catch (_ignored) { /* ignore */ }
+        return {
+            sessionId: sessionId,
+            pin: pin,
+            shopId: shopId,
+            shopSlug: shopSlug
+        };
     }
 
     function enrichConnectDetailWithOpenMeta(detail, opened, payload) {
@@ -550,6 +855,17 @@
         return (global._serverBase || 'http://localhost:8080').replace(/\/$/, '');
     }
 
+    function inferGuestCatalogReadBase() {
+        if (typeof global._gatePublicBase === 'string' && global._gatePublicBase.trim()) {
+            return global._gatePublicBase.trim().replace(/\/$/, '');
+        }
+        return inferGuestApiBase();
+    }
+
+    function usesGateCatalogRead() {
+        return typeof global._gatePublicBase === 'string' && global._gatePublicBase.trim().length > 0;
+    }
+
     function inferGuestOrderPublicBase() {
         if (typeof global._orderPublicBase === 'string' && global._orderPublicBase.trim()) {
             return global._orderPublicBase.trim().replace(/\/$/, '');
@@ -561,14 +877,74 @@
         return (typeof location !== 'undefined' ? location.origin : '').replace(/\/$/, '');
     }
 
+    var GUEST_PUBLIC_SHOP_CACHE_PREFIX = 'mo_guest_public_shop:';
+    var GUEST_PUBLIC_SHOP_CACHE_TTL_MS = 5 * 60 * 1000;
+    var GUEST_ORDER_BUNDLE_CACHE_PREFIX = 'mo_guest_order_bundle:';
+    var GUEST_ORDER_BUNDLE_CACHE_TTL_MS = 5 * 60 * 1000;
+
+    function readGuestSessionJsonCache(storageKey) {
+        if (typeof sessionStorage === 'undefined') {
+            return null;
+        }
+        try {
+            var raw = sessionStorage.getItem(storageKey);
+            if (!raw) {
+                return null;
+            }
+            var parsed = JSON.parse(raw);
+            if (!parsed || typeof parsed !== 'object' || !parsed.savedAt) {
+                return null;
+            }
+            return parsed;
+        } catch (_ignored) {
+            return null;
+        }
+    }
+
+    function writeGuestSessionJsonCache(storageKey, payload) {
+        if (typeof sessionStorage === 'undefined') {
+            return;
+        }
+        try {
+            sessionStorage.setItem(storageKey, JSON.stringify({
+                savedAt: Date.now(),
+                payload: payload
+            }));
+        } catch (_ignored) { /* quota */ }
+    }
+
+    function invalidateGuestOrderBundleCache(shopId) {
+        if (typeof sessionStorage === 'undefined' || shopId == null || shopId === '') {
+            return;
+        }
+        var prefix = GUEST_ORDER_BUNDLE_CACHE_PREFIX + String(shopId) + ':';
+        var keysToRemove = [];
+        for (var i = 0; i < sessionStorage.length; i++) {
+            var key = sessionStorage.key(i);
+            if (key && key.indexOf(prefix) === 0) {
+                keysToRemove.push(key);
+            }
+        }
+        keysToRemove.forEach(function (key) {
+            sessionStorage.removeItem(key);
+        });
+    }
+
     function fetchPublicShop(shopSlug, apiBase) {
         var base = (apiBase || inferGuestApiBase()).replace(/\/$/, '');
         var slug = displayPathSlug(shopSlug) || String(shopSlug || '').trim();
         if (!slug) {
             return Promise.resolve(null);
         }
+        var cacheKey = GUEST_PUBLIC_SHOP_CACHE_PREFIX + slug;
+        var cached = readGuestSessionJsonCache(cacheKey);
         var http = core.createHttpClient({ baseUrl: base });
-        return http.get(guestPaths.shopBySlug(slug)).catch(function (err) {
+        var network = http.get(guestPaths.shopBySlug(slug)).then(function (shop) {
+            if (shop && shop.shopId) {
+                writeGuestSessionJsonCache(cacheKey, shop);
+            }
+            return shop;
+        }).catch(function (err) {
             if (err && err.status === 404) {
                 return null;
             }
@@ -577,6 +953,15 @@
             }
             throw new Error('店舗情報の取得に失敗しました');
         });
+        if (cached && cached.payload) {
+            var age = Date.now() - Number(cached.savedAt || 0);
+            if (age <= GUEST_PUBLIC_SHOP_CACHE_TTL_MS) {
+                return Promise.resolve(cached.payload);
+            }
+            void network.catch(function () { /* keep stale on revalidate failure */ });
+            return Promise.resolve(cached.payload);
+        }
+        return network;
     }
 
     function applyGuestBranding(shop) {
@@ -667,8 +1052,74 @@
         return {
             menuId: resolveOrderHistoryMenuId(item),
             menuName: resolveOrderHistoryMenuName(item),
-            quantity: item.quantity != null ? Number(item.quantity) : 0
+            quantity: item.quantity != null ? Number(item.quantity) : 0,
+            unitPrice: item.unitPrice != null ? Number(item.unitPrice) : null,
+            priceAtOrder: item.priceAtOrder != null ? Number(item.priceAtOrder) : null,
+            subTotal: item.subTotal != null ? Number(item.subTotal) : null,
+            toppingPrice: item.toppingPrice != null ? Number(item.toppingPrice) : 0,
+            basePrice: item.basePrice != null ? Number(item.basePrice) : null,
+            taxCategory: item.taxCategoryAtOrder || item.taxCategory || null
         };
+    }
+
+    function resolveOrderHistoryDisplayTotal(order, sessionType) {
+        var tax = global.MasterOrderConsumptionTax;
+        var session = sessionType;
+        var items = order && Array.isArray(order.items) ? order.items : [];
+        if (items.length) {
+            var fromUnitPrice = items.reduce(function (sum, item) {
+                if (!item) {
+                    return sum;
+                }
+                var qty = Number(item.quantity || 0);
+                if (qty <= 0) {
+                    return sum;
+                }
+                var unit = Number(item.unitPrice || item.priceAtOrder || 0)
+                    + Number(item.toppingPrice || 0);
+                if (unit > 0) {
+                    return sum + unit * qty;
+                }
+                return sum;
+            }, 0);
+            if (fromUnitPrice > 0) {
+                return fromUnitPrice;
+            }
+            if (tax && typeof tax.calculateCartGrandTotal === 'function') {
+                return tax.calculateCartGrandTotal(items, session);
+            }
+        }
+        var baseTotal = Number(order && (order.total != null ? order.total : order.totalPrice) || 0);
+        if (baseTotal > 0 && tax && typeof tax.calculateOrderTotals === 'function' && items.length) {
+            var taxLines = items.map(function (item) {
+                if (!item) {
+                    return null;
+                }
+                var qty = Number(item.quantity || 0);
+                if (qty <= 0) {
+                    return null;
+                }
+                var lineBase = Number(item.subTotal || 0);
+                if (lineBase <= 0) {
+                    var unitBase = Number(item.basePrice || 0);
+                    if (unitBase > 0) {
+                        lineBase = unitBase * qty;
+                    }
+                }
+                if (lineBase <= 0) {
+                    return null;
+                }
+                return {
+                    basePrice: lineBase / qty,
+                    taxCategory: item.taxCategory || (tax.TaxCategory && tax.TaxCategory.STANDARD) || 'STANDARD',
+                    quantity: qty
+                };
+            }).filter(function (line) { return !!line; });
+            if (taxLines.length) {
+                return tax.calculateOrderTotals(taxLines, session).grandTotal;
+            }
+        }
+        return baseTotal;
     }
 
     function resolveGuestMenuDisplayName(menuId, menus, fallbackName) {
@@ -733,7 +1184,10 @@
             const mapped = {
                 orderId: order.orderId != null ? order.orderId : null,
                 timestamp: formatOrderTime(order.orderTime, { timeZone: timeZone }),
-                total: Number(order.totalPrice || 0),
+                total: resolveOrderHistoryDisplayTotal({
+                    items: rawItems,
+                    totalPrice: order.totalPrice
+                }, options.sessionType),
                 status: order.status != null ? String(order.status) : '',
                 items: items
             };
@@ -806,12 +1260,10 @@
 
         const normalizedItems = items.map(normalizeOrderHistoryItem).filter(function (item) { return !!item; });
 
-        const total = items.reduce(function (sum, item) {
-            const unit = Number(item.priceAtOrder || item.unitPrice || 0)
-                + Number(item.toppingPrice || 0);
-            const qty = Number(item.quantity || 0);
-            return sum + unit * qty;
-        }, 0);
+        const tax = global.MasterOrderConsumptionTax;
+        const total = tax && typeof tax.calculateCartGrandTotal === 'function'
+            ? tax.calculateCartGrandTotal(items, options.sessionType)
+            : resolveOrderHistoryDisplayTotal({ items: items }, options.sessionType);
 
         const entry = {
             orderId: null,
@@ -850,16 +1302,24 @@
         return topping.id != null;
     }
 
+    function normalizeToppingIdRef(id) {
+        if (id == null || id === '') {
+            return '';
+        }
+        return String(id).trim();
+    }
+
     function countSelectedInGroup(toppingIds, group) {
         const toppings = Array.isArray(group.toppings) ? group.toppings : [];
         const orderableIds = toppings.filter(isOrderablePublicTopping).map(function (t) {
-            return Number(t.id);
+            return normalizeToppingIdRef(t.id);
         });
         if (!toppingIds || !toppingIds.length || !orderableIds.length) {
             return 0;
         }
         return toppingIds.filter(function (id) {
-            return orderableIds.indexOf(Number(id)) >= 0;
+            const ref = normalizeToppingIdRef(id);
+            return ref && orderableIds.indexOf(ref) >= 0;
         }).length;
     }
 
@@ -962,8 +1422,19 @@
 
     function parseJoinCredentialsFromSearch(search) {
         const params = new URLSearchParams(search || '');
-        const sessionId = sanitizeGuestSessionId(params.get(JOIN_SESSION_PARAM) || params.get('id') || '');
-        const pin = sanitizeGuestJoinPin(params.get(JOIN_PIN_PARAM) || params.get('pass') || '');
+        var rawId = params.get(JOIN_SESSION_PARAM) || params.get('id') || '';
+        var rawPin = params.get(JOIN_PIN_PARAM) || params.get('pass') || '';
+        if (!rawPin && rawId) {
+            var malformed = String(rawId).match(
+                /^([ABEFGHJKMNPQRTUVWXYZabefghjkmnpqrtuvwxyz]{10})pass=([A-Za-z0-9]+)$/i
+            );
+            if (malformed) {
+                rawId = malformed[1];
+                rawPin = malformed[2];
+            }
+        }
+        const sessionId = sanitizeGuestSessionId(rawId);
+        const pin = sanitizeGuestJoinPin(rawPin);
         if (!sessionId || !pin) {
             return { sessionId: '', pin: '' };
         }
@@ -995,9 +1466,21 @@
             return { sessionId: '', pin: '' };
         }
 
-        var fromContext = parseSessionContextFromStorage();
-        if (fromContext) {
-            return fromContext;
+        var fromSearch = parseJoinCredentialsFromSearch(loc.search);
+        if (fromSearch.sessionId && fromSearch.pin) {
+            stashJoinCredentialsForRoute(fromSearch.sessionId, fromSearch.pin);
+            return fromSearch;
+        }
+
+        const hash = (loc.hash || '').replace(/^#/, '');
+        if (hash) {
+            const fromHash = parseJoinCredentialsFromSearch(
+                hash.charAt(0) === '?' ? hash : '?' + hash
+            );
+            if (fromHash.sessionId && fromHash.pin) {
+                stashJoinCredentialsForRoute(fromHash.sessionId, fromHash.pin);
+                return fromHash;
+            }
         }
 
         if (typeof sessionStorage !== 'undefined') {
@@ -1015,22 +1498,77 @@
             } catch (_) { /* ignore */ }
         }
 
-        const hash = (loc.hash || '').replace(/^#/, '');
-        if (hash) {
-            const fromHash = parseJoinCredentialsFromSearch(
-                hash.charAt(0) === '?' ? hash : '?' + hash
-            );
-            if (fromHash.sessionId && fromHash.pin) {
-                return fromHash;
-            }
+        var fromContext = parseSessionContextFromStorage();
+        if (fromContext) {
+            return fromContext;
         }
 
-        var fromSearch = parseJoinCredentialsFromSearch(loc.search);
-        if (fromSearch.sessionId && fromSearch.pin) {
-            stripLegacyMoQueryParams();
-            return fromSearch;
-        }
         return fromSearch;
+    }
+
+    /**
+     * 店舗ページ bootstrap 用: URL → localStorage / sessionStorage の順で接続資格を解決する。
+     */
+    function resolveGuestConnectCredentials(options) {
+        options = options || {};
+        var explicitSessionId = sanitizeGuestSessionId(options.sessionId || '');
+        var explicitPin = sanitizeGuestJoinPin(options.pin || '');
+        var fromUrl = parseJoinCredentialsFromLocation();
+        var reconnect = loadGuestReconnectCredentials();
+        var sessionId = String(
+            explicitSessionId || fromUrl.sessionId || reconnect.sessionId || ''
+        ).trim();
+        var pin = String(
+            explicitPin || fromUrl.pin || reconnect.pin || ''
+        ).trim().toUpperCase();
+        var shopId = reconnect.shopId != null ? reconnect.shopId : null;
+        var shopSlug = String(reconnect.shopSlug || '').trim();
+        var routeSlug = String(options.shopSlug || '').trim();
+        var routeShopId = options.shopId != null ? Number(options.shopId) : null;
+        var credsFromNavigation = !!(explicitSessionId && explicitPin)
+            || !!(fromUrl.sessionId && fromUrl.pin
+                && typeof location !== 'undefined'
+                && parseJoinCredentialsFromSearch(location.search).sessionId);
+
+        if (!sessionId || !pin) {
+            return {
+                sessionId: '',
+                pin: '',
+                shopId: shopId,
+                shopSlug: shopSlug,
+                shouldConnect: false
+            };
+        }
+        if (!credsFromNavigation) {
+            if (routeShopId != null && routeShopId > 0 && shopId != null
+                && Number(shopId) !== routeShopId) {
+                return {
+                    sessionId: sessionId,
+                    pin: pin,
+                    shopId: shopId,
+                    shopSlug: shopSlug,
+                    shouldConnect: false,
+                    mismatch: 'shopId'
+                };
+            }
+            if (routeSlug && shopSlug && !guestSlugMatches(routeSlug, shopSlug)) {
+                return {
+                    sessionId: sessionId,
+                    pin: pin,
+                    shopId: shopId,
+                    shopSlug: shopSlug,
+                    shouldConnect: false,
+                    mismatch: 'shopSlug'
+                };
+            }
+        }
+        return {
+            sessionId: sessionId,
+            pin: pin,
+            shopId: routeShopId > 0 ? routeShopId : shopId,
+            shopSlug: routeSlug || shopSlug,
+            shouldConnect: true
+        };
     }
 
     function stashJoinCredentialsForRoute(sessionId, pin) {
@@ -1048,19 +1586,19 @@
         }));
     }
 
-    function buildFixedQrConnectUrl(baseUrl, shopId, tableNo, passPhrase) {
+    function buildFixedQrConnectUrl(baseUrl, shopSlug, tableNo, passPhrase) {
         const base = String(baseUrl || '').replace(/\/$/, '');
-        const sid = shopId != null ? String(shopId).trim() : '';
+        const slug = displayPathSlug(shopSlug) || String(shopSlug || '').trim();
         const table = tableNo != null ? String(tableNo).trim() : '';
         const pass = String(passPhrase || '').trim();
-        if (!base || !sid || !table || !pass) {
+        const path = buildShopScopedGuestPath(slug);
+        if (!base || !path || !table || !pass) {
             return '';
         }
         const params = new URLSearchParams();
-        params.set(FIXED_QR_SHOP_PARAM, sid);
         params.set(FIXED_QR_TABLE_PARAM, table);
         params.set(FIXED_QR_PASS_PARAM, pass);
-        return base + '/connect?' + params.toString();
+        return base + path + '?' + params.toString();
     }
 
     function parseFixedQrCredentialsFromSearch(search) {
@@ -1075,26 +1613,27 @@
         };
     }
 
-    function buildOrderJoinUrlFromToken(baseUrl, joinToken) {
+    function buildOrderJoinUrlFromToken(baseUrl, joinToken, shopSlug) {
         const base = String(baseUrl || '').replace(/\/$/, '');
         const token = String(joinToken || '').trim();
-        if (!base || !token) {
-            return '';
-        }
-        return base + '/?' + JOIN_TOKEN_PARAM + '=' + encodeURIComponent(token);
-    }
-
-    function buildOrderJoinUrl(baseUrl, sessionId, pin) {
-        const base = String(baseUrl || '').replace(/\/$/, '');
-        const id = sanitizeGuestSessionId(sessionId);
-        const normalizedPin = sanitizeGuestJoinPin(pin);
-        if (!base || !id || !normalizedPin) {
+        const slug = displayPathSlug(shopSlug) || String(shopSlug || '').trim();
+        if (!base || !token || !slug) {
             return '';
         }
         const params = new URLSearchParams();
-        params.set(JOIN_SESSION_PARAM, id);
-        params.set(JOIN_PIN_PARAM, normalizedPin);
-        return base + '/#' + params.toString();
+        params.set(JOIN_TOKEN_PARAM, token);
+        return base + buildShopScopedGuestPath(slug) + '?' + params.toString();
+    }
+
+    function buildOrderJoinUrl(baseUrl, sessionId, pin, shopSlug) {
+        const base = String(baseUrl || '').replace(/\/$/, '');
+        const id = sanitizeGuestSessionId(sessionId);
+        const normalizedPin = sanitizeGuestJoinPin(pin);
+        const slug = displayPathSlug(shopSlug) || String(shopSlug || '').trim();
+        if (!base || !id || !normalizedPin || !slug) {
+            return '';
+        }
+        return base + buildShopScopedGuestUrl(slug, id, normalizedPin);
     }
 
     function stripJoinCredentialsFromUrl(cleanPath) {
@@ -1105,7 +1644,11 @@
         const params = new URLSearchParams(location.search || '');
         params.delete(JOIN_SESSION_PARAM);
         params.delete(JOIN_PIN_PARAM);
-        const keepIdPass = /^\/connect(\/|$)/.test(path);
+        const pathNorm = path.replace(/\/+$/, '') || '/';
+        const route = parseGuestRoute(pathNorm);
+        const keepIdPass = route.type === 'shop-slug'
+            && (params.has('id') || params.has('pass')
+                || params.has(JOIN_SESSION_PARAM) || params.has(JOIN_PIN_PARAM));
         if (!keepIdPass) {
             params.delete('id');
             params.delete('pass');
@@ -1117,34 +1660,58 @@
         history.replaceState(history.state, document.title, qs ? path + '?' + qs : path);
     }
 
-    function saveSessionCredentials(sessionId, pin) {
-        if (typeof localStorage === 'undefined') {
+    function saveSessionCredentials(sessionId, pin, meta) {
+        if (typeof sessionStorage === 'undefined') {
             return;
         }
+        meta = meta && typeof meta === 'object' ? meta : {};
         if (sessionId) {
-            localStorage.setItem(LS_SESSION_ID, sessionId);
+            sessionStorage.setItem(LS_SESSION_ID, sessionId);
         }
         if (pin) {
-            localStorage.setItem(LS_PIN, String(pin).trim().toUpperCase());
+            sessionStorage.setItem(LS_PIN, String(pin).trim().toUpperCase());
+        }
+        if (meta.shopSlug) {
+            sessionStorage.setItem(LS_SESSION_SHOP_SLUG, String(meta.shopSlug).trim());
+        }
+        if (meta.shopId != null && meta.shopId !== '') {
+            sessionStorage.setItem(LS_SESSION_SHOP_ID, String(meta.shopId));
+        }
+        if (typeof localStorage !== 'undefined') {
+            localStorage.removeItem(LS_SESSION_ID);
+            localStorage.removeItem(LS_PIN);
+            localStorage.removeItem(LS_SESSION_SHOP_SLUG);
+            localStorage.removeItem(LS_SESSION_SHOP_ID);
         }
     }
 
     function loadSessionCredentials() {
-        if (typeof localStorage === 'undefined') {
-            return { sessionId: '', pin: '' };
+        if (typeof sessionStorage === 'undefined') {
+            return { sessionId: '', pin: '', shopSlug: '', shopId: null };
         }
+        var shopIdRaw = sessionStorage.getItem(LS_SESSION_SHOP_ID);
         return {
-            sessionId: localStorage.getItem(LS_SESSION_ID) || '',
-            pin: localStorage.getItem(LS_PIN) || ''
+            sessionId: sessionStorage.getItem(LS_SESSION_ID) || '',
+            pin: sessionStorage.getItem(LS_PIN) || '',
+            shopSlug: sessionStorage.getItem(LS_SESSION_SHOP_SLUG) || '',
+            shopId: shopIdRaw != null && shopIdRaw !== '' ? Number(shopIdRaw) : null
         };
     }
 
     function clearSessionCredentials() {
-        if (typeof localStorage === 'undefined') {
+        if (typeof sessionStorage === 'undefined') {
             return;
         }
-        localStorage.removeItem(LS_SESSION_ID);
-        localStorage.removeItem(LS_PIN);
+        sessionStorage.removeItem(LS_SESSION_ID);
+        sessionStorage.removeItem(LS_PIN);
+        sessionStorage.removeItem(LS_SESSION_SHOP_SLUG);
+        sessionStorage.removeItem(LS_SESSION_SHOP_ID);
+        if (typeof localStorage !== 'undefined') {
+            localStorage.removeItem(LS_SESSION_ID);
+            localStorage.removeItem(LS_PIN);
+            localStorage.removeItem(LS_SESSION_SHOP_SLUG);
+            localStorage.removeItem(LS_SESSION_SHOP_ID);
+        }
     }
 
     function resolvePinFromContext(explicitPin) {
@@ -1420,8 +1987,8 @@
             if (!line) {
                 return;
             }
-            var tops = (line.toppingIds || []).slice().sort(function (x, y) {
-                return x - y;
+            var tops = (line.toppingIds || []).slice().map(normalizeToppingIdRef).filter(Boolean).sort(function (x, y) {
+                return x.localeCompare(y);
             });
             parts.push(String(line.menuId) + ':' + String(line.quantity) + ':' + tops.join(','));
         });
@@ -1481,6 +2048,33 @@
     function enrichGuestOrderApiError(err) {
         if (!err || typeof err !== 'object') {
             return err;
+        }
+        var payload = err.payload;
+        if (payload && typeof payload === 'object') {
+            if (payload.code === 'CATALOG_STALE' || payload.code === 'PRICE_MISMATCH') {
+                err.code = 'CATALOG_STALE';
+                err.returnToCart = true;
+                err.refreshCatalog = true;
+                err.message = payload.message || '注意：価格が変更されました。カートの内容をご確認ください。';
+                if (payload.catalogGeneration != null) {
+                    err.catalogGeneration = payload.catalogGeneration;
+                }
+            } else if (payload.code === 'NODE_QUARANTINED') {
+                var quarantineMsg = String(payload.message || '');
+                if (/price mismatch/i.test(quarantineMsg)) {
+                    err.code = 'CATALOG_STALE';
+                    err.returnToCart = true;
+                    err.refreshCatalog = true;
+                    err.message = '注意：価格が変更されました。カートの内容をご確認ください。';
+                    if (payload.catalogGeneration != null) {
+                        err.catalogGeneration = payload.catalogGeneration;
+                    }
+                } else {
+                    err.code = 'NODE_QUARANTINED';
+                    err.returnToCart = true;
+                    err.message = payload.message || '注文を処理できませんでした。店舗にお知らせください。';
+                }
+            }
         }
         var parsed = parseGuestOrderSubmitBody(err.payload, err.requestId || null);
         if (parsed && parsed.allowed === false) {
@@ -1544,11 +2138,109 @@
         return false;
     }
 
+    function resolveGuestMenuDisplayPrice(menu) {
+        if (!menu || typeof menu !== 'object') {
+            return 0;
+        }
+        var tax = global.MasterOrderConsumptionTax;
+        if (tax && menu.basePrice != null && Number(menu.basePrice) > 0) {
+            return tax.deriveTaxInclusiveFromBase(
+                Number(menu.basePrice),
+                menu.taxCategory || (tax.TaxCategory && tax.TaxCategory.STANDARD) || 'STANDARD',
+                (tax.ServiceSessionType && tax.ServiceSessionType.DINE_IN) || 'DINE_IN'
+            );
+        }
+        return Number(menu.price) || 0;
+    }
+
+    function guestCartLineUnitTotal(cartLine) {
+        if (!cartLine || typeof cartLine !== 'object') {
+            return 0;
+        }
+        return Number(cartLine.priceAtOrder || 0) + Number(cartLine.toppingPrice || 0);
+    }
+
+    function findGuestCartPriceDrift(cart, menus) {
+        var lines = Array.isArray(cart) ? cart : [];
+        var menuList = Array.isArray(menus) ? menus : [];
+        if (!lines.length || !menuList.length) {
+            return [];
+        }
+        var menuById = {};
+        menuList.forEach(function (menu) {
+            if (menu && menu.id != null) {
+                menuById[menu.id] = menu;
+            }
+        });
+        var drift = [];
+        lines.forEach(function (line) {
+            if (!line || line.menuId == null) {
+                return;
+            }
+            var menu = menuById[line.menuId];
+            if (!menu) {
+                return;
+            }
+            var currentUnit = resolveGuestMenuDisplayPrice(menu) + Number(line.toppingPrice || 0);
+            var cartUnit = guestCartLineUnitTotal(line);
+            if (currentUnit !== cartUnit) {
+                drift.push({
+                    menuId: line.menuId,
+                    menuName: line.menuName || menu.name || '',
+                    cartUnit: cartUnit,
+                    currentUnit: currentUnit
+                });
+            }
+        });
+        return drift;
+    }
+
+    function reconcileGuestCartPrices(cart, menus) {
+        var lines = Array.isArray(cart) ? cart : [];
+        var drift = findGuestCartPriceDrift(lines, menus);
+        if (!drift.length) {
+            return { changed: false, drift: [] };
+        }
+        var menuById = {};
+        (Array.isArray(menus) ? menus : []).forEach(function (menu) {
+            if (menu && menu.id != null) {
+                menuById[menu.id] = menu;
+            }
+        });
+        lines.forEach(function (line) {
+            if (!line || line.menuId == null) {
+                return;
+            }
+            var menu = menuById[line.menuId];
+            if (!menu) {
+                return;
+            }
+            line.priceAtOrder = resolveGuestMenuDisplayPrice(menu);
+        });
+        return { changed: true, drift: drift };
+    }
+
+    function isGuestOrderPriceStaleError(err) {
+        err = enrichGuestOrderApiError(err);
+        if (!err) {
+            return false;
+        }
+        if (err.code === 'CATALOG_STALE' || err.refreshCatalog === true) {
+            return true;
+        }
+        var payload = err.payload;
+        if (payload && (payload.code === 'CATALOG_STALE' || payload.code === 'PRICE_MISMATCH')) {
+            return true;
+        }
+        return false;
+    }
+
     function normalizeGuestMenu(menu) {
         if (!menu || typeof menu !== 'object') {
             return null;
         }
         var normalized = Object.assign({}, menu);
+        normalized.price = resolveGuestMenuDisplayPrice(normalized);
         if (normalized.isAvailable === false) {
             normalized.soldOut = true;
             normalized.stockStatusLabel = '在庫切れ';
@@ -1733,9 +2425,6 @@
             if (shopId == null && typeof loaderOptions.getShopId === 'function') {
                 shopId = loaderOptions.getShopId();
             }
-            if (shopId == null && !viewOnly) {
-                shopId = 1;
-            }
             var keyword = String(opts.keyword || '').trim();
             var allMenus = Array.isArray(opts.allMenus) ? opts.allMenus : [];
             var currentMenus = Array.isArray(opts.menus) ? opts.menus : [];
@@ -1787,9 +2476,12 @@
                     return {
                         menus: bundle.menus || [],
                         toppings: bundle.toppings || {},
+                        recommendMenus: bundle.recommendMenus || null,
                         requestedLang: bundle.requestedLang,
                         resolvedLang: bundle.resolvedLang,
                         availableLanguages: bundle.availableLanguages,
+                        catalogGeneration: bundle.catalogGeneration,
+                        catalogPublishedAt: bundle.catalogPublishedAt,
                         prefetchToppings: false
                     };
                 });
@@ -1815,7 +2507,9 @@
                 var nextAllMenus = keyword ? allMenus : menus;
                 var saveHook = loaderOptions.saveMenuCache;
                 if (typeof saveHook === 'function') {
-                    Promise.resolve(saveHook(shopId, menus)).catch(function () { /* ignore IDB errors */ });
+                    Promise.resolve(saveHook(shopId, menus, {
+                        catalogGeneration: fetched.catalogGeneration
+                    })).catch(function () { /* ignore IDB errors */ });
                 }
                 return finish({
                     stale: false,
@@ -1823,10 +2517,13 @@
                     menus: menus,
                     allMenus: nextAllMenus,
                     toppings: fetched.toppings,
+                    recommendMenus: fetched.recommendMenus,
                     prefetchToppings: fetched.prefetchToppings,
                     requestedLang: fetched.requestedLang || requestLang,
                     resolvedLang: fetched.resolvedLang || requestLang,
                     availableLanguages: fetched.availableLanguages,
+                    catalogGeneration: fetched.catalogGeneration,
+                    catalogPublishedAt: fetched.catalogPublishedAt,
                     activeCategory: resolveGuestMenuActiveCategory(opts.activeCategory, menus),
                     keyword: keyword,
                     shopId: shopId,
@@ -1915,8 +2612,15 @@
         if ('menuLoadState' in state) {
             state.menuLoadState = result.loadState || GUEST_MENU_LOAD_STATE.IDLE;
         }
+        if (result.catalogGeneration != null && 'catalogGeneration' in state) {
+            state.catalogGeneration = result.catalogGeneration;
+        }
+        if (result.recommendMenus && 'recommendMenus' in state) {
+            state.recommendMenus = result.recommendMenus;
+        }
         return {
             toppings: result.toppings,
+            recommendMenus: result.recommendMenus,
             prefetchToppings: result.prefetchToppings,
             shopId: result.shopId,
             fromCache: result.fromCache,
@@ -1926,7 +2630,8 @@
             keyword: result.keyword,
             requestedLang: result.requestedLang,
             resolvedLang: result.resolvedLang,
-            availableLanguages: result.availableLanguages
+            availableLanguages: result.availableLanguages,
+            catalogGeneration: result.catalogGeneration
         };
     }
 
@@ -1947,25 +2652,41 @@
                 if (state && state.viewOnly && !state.shopId) {
                     return null;
                 }
-                return state && state.shopId != null ? state.shopId : 1;
+                return state && state.shopId != null ? state.shopId : null;
             },
             saveMenuCache: typeof options.saveMenuCache === 'function'
                 ? options.saveMenuCache
                 : (offlineApi && typeof offlineApi.saveMenuCache === 'function'
-                    ? function (shopId, menus) { return offlineApi.saveMenuCache(shopId, menus); }
+                    ? function (shopId, menus, meta) { return offlineApi.saveMenuCache(shopId, menus, meta); }
                     : undefined),
             loadMenuCache: typeof options.loadMenuCache === 'function'
                 ? options.loadMenuCache
                 : (offlineApi && typeof offlineApi.loadMenuCache === 'function'
-                    ? function (shopId) { return offlineApi.loadMenuCache(shopId); }
+                    ? function (shopId) {
+                        var expectedGen = state && state.catalogGeneration != null
+                            ? state.catalogGeneration
+                            : null;
+                        return offlineApi.loadMenuCache(shopId, expectedGen);
+                    }
                     : undefined)
         });
     }
 
     function createOrderSdk(options) {
         options = options || {};
+        var fallbackBases = options.fallbackBaseUrls;
+        if (!fallbackBases && typeof window !== 'undefined' && window._serverBaseFallbacks) {
+            fallbackBases = window._serverBaseFallbacks;
+        }
         const http = core.createHttpClient({
             baseUrl: options.apiBaseUrl,
+            fallbackBaseUrls: fallbackBases,
+            getAccessToken: options.getAccessToken || options.getIdToken,
+            onUnauthorized: options.onUnauthorized
+        });
+        const catalogHttp = core.createHttpClient({
+            baseUrl: options.catalogReadBaseUrl || inferGuestCatalogReadBase(),
+            fallbackBaseUrls: fallbackBases,
             getAccessToken: options.getAccessToken || options.getIdToken,
             onUnauthorized: options.onUnauthorized
         });
@@ -2142,9 +2863,13 @@
                 if (shouldLogGuestOrderToConsole(guestMeta)) {
                     logGuestOrderConsole('request', { request: requestSnapshot });
                 }
+                var postBody = { items: items };
+                if (guestMeta && guestMeta.catalogGeneration != null) {
+                    postBody.catalogGeneration = guestMeta.catalogGeneration;
+                }
                 var promise = http.post(
                     guestPaths.submitOrder(sessionId),
-                    { items: items },
+                    postBody,
                     withGuestOrderHeaders({}, pin, {
                         clientId: plan.clientId,
                         idempotencyKey: plan.requestId
@@ -2199,7 +2924,11 @@
             parseGuestOrderSubmitBody: parseGuestOrderSubmitBody,
             searchMenus: function (opts) {
                 opts = opts || {};
-                return http.get(core.withQuery(guestPaths.menuSearch(), {
+                var readHttp = usesGateCatalogRead() ? catalogHttp : http;
+                var searchPath = usesGateCatalogRead()
+                    ? gateGuestPaths.menuSearch()
+                    : guestPaths.menuSearch();
+                return readHttp.get(core.withQuery(searchPath, {
                     shopId: opts.shopId,
                     name: opts.name,
                     lang: opts.lang || getGuestMenuLang(),
@@ -2210,33 +2939,75 @@
                         : [];
                 });
             },
-            getToppingGroupsForMenu: function (menuId) {
+            getToppingGroupsForMenu: function (menuId, shopId) {
+                if (usesGateCatalogRead()) {
+                    if (shopId == null || shopId === '') {
+                        return Promise.reject(new Error('shopId is required for topping groups'));
+                    }
+                    return catalogHttp.get(core.withQuery(gateGuestPaths.toppingGroupsForMenu(menuId), {
+                        shopId: shopId,
+                        _: Date.now()
+                    }));
+                }
                 return http.get(guestPaths.toppingGroupsForMenu(menuId));
             },
             loadOrderToppingCatalog: function (shopId) {
-                return http.get(guestPaths.orderToppingCatalog(shopId));
+                var readHttp = usesGateCatalogRead() ? catalogHttp : http;
+                var path = usesGateCatalogRead()
+                    ? gateGuestPaths.orderToppingCatalog(shopId)
+                    : guestPaths.orderToppingCatalog(shopId);
+                return readHttp.get(path);
             },
             loadOrderBundle: function (shopId, name, options) {
                 options = options || {};
-                return http.get(core.withQuery(guestPaths.orderBundle(shopId), {
-                    name: name || '',
-                    lang: options.lang || getGuestMenuLang(),
-                    _: Date.now()
-                })).then(function (bundle) {
-                    var raw = bundle || {};
+                var lang = options.lang || getGuestMenuLang();
+                var cacheKey = GUEST_ORDER_BUNDLE_CACHE_PREFIX + shopId + ':' + lang + ':' + (name || '');
+                var cached = readGuestSessionJsonCache(cacheKey);
+                var readHttp = usesGateCatalogRead() ? catalogHttp : http;
+                var bundlePath = usesGateCatalogRead()
+                    ? gateGuestPaths.orderBundle(shopId)
+                    : guestPaths.orderBundle(shopId);
+
+                function normalizeBundle(raw) {
+                    raw = raw || {};
+                    var recommend = raw.recommendMenus;
                     return {
                         menus: Array.isArray(raw.menus)
                             ? raw.menus.map(normalizeGuestMenu).filter(Boolean)
                             : [],
                         toppings: raw.toppings && typeof raw.toppings === 'object' ? raw.toppings : {},
-                        requestedLang: raw.requestedLang || options.lang || null,
-                        resolvedLang: raw.resolvedLang || options.lang || getGuestMenuLang(),
+                        recommendMenus: recommend
+                            ? core.normalizeRecommendMenusResponse(recommend)
+                            : null,
+                        requestedLang: raw.requestedLang || lang || null,
+                        resolvedLang: raw.resolvedLang || lang || getGuestMenuLang(),
                         availableLanguages: Array.isArray(raw.availableLanguages)
                             ? raw.availableLanguages
-                            : [GUEST_MENU_LANG_DEFAULT]
+                            : [GUEST_MENU_LANG_DEFAULT],
+                        catalogGeneration: raw.catalogGeneration != null ? Number(raw.catalogGeneration) : null,
+                        catalogPublishedAt: raw.catalogPublishedAt || null,
+                        adsEnabled: raw.adsEnabled !== false
                     };
+                }
+
+                var network = readHttp.get(core.withQuery(bundlePath, {
+                    name: name || '',
+                    lang: lang,
+                    _: Date.now()
+                })).then(function (bundle) {
+                    var normalized = normalizeBundle(bundle);
+                    writeGuestSessionJsonCache(cacheKey, normalized);
+                    return normalized;
                 });
+
+                if (cached && cached.payload) {
+                    return network.catch(function () {
+                        return normalizeBundle(cached.payload);
+                    });
+                }
+                return network;
             },
+            invalidateGuestOrderBundleCache: invalidateGuestOrderBundleCache,
             getGuestMenuLang: getGuestMenuLang,
             setGuestMenuLang: setGuestMenuLang,
             isGuestMenuLangExplicit: isGuestMenuLangExplicit,
@@ -2252,7 +3023,11 @@
             loadShopMenus: function (opts) {
                 opts = opts || {};
                 var shopId = opts.shopId;
-                return http.get(core.withQuery(guestPaths.menuSearch(), {
+                var readHttp = usesGateCatalogRead() ? catalogHttp : http;
+                var searchPath = usesGateCatalogRead()
+                    ? gateGuestPaths.menuSearch()
+                    : guestPaths.menuSearch();
+                return readHttp.get(core.withQuery(searchPath, {
                     shopId: shopId,
                     name: opts.name,
                     lang: opts.lang || getGuestMenuLang(),
@@ -2269,6 +3044,7 @@
             createLocalOrderHistoryEntry: createLocalOrderHistoryEntry,
             mergeOrderHistoryWithPending: mergeOrderHistoryWithPending,
             mapOrderHistory: mapOrderHistory,
+            resolveOrderHistoryDisplayTotal: resolveOrderHistoryDisplayTotal,
             resolveGuestMenuDisplayName: resolveGuestMenuDisplayName,
             formatOrderHistoryLines: formatOrderHistoryLines,
             validateGuestOrderSubmission: validateGuestOrderSubmission,
@@ -2276,6 +3052,10 @@
             formatOrderSendStatusLabel: formatOrderSendStatusLabel,
             ORDER_SEND_STATUS: ORDER_SEND_STATUS,
             normalizeGuestMenu: normalizeGuestMenu,
+            resolveGuestMenuDisplayPrice: resolveGuestMenuDisplayPrice,
+            findGuestCartPriceDrift: findGuestCartPriceDrift,
+            reconcileGuestCartPrices: reconcileGuestCartPrices,
+            isGuestOrderPriceStaleError: isGuestOrderPriceStaleError,
             isGuestMenuSoldOut: isGuestMenuSoldOut,
             createSessionResyncMonitor: function (monitorOptions) {
                 monitorOptions = monitorOptions || {};
@@ -2379,11 +3159,13 @@
         } catch (_) {
             return { kind: 'invalid', raw: raw };
         }
+        var route = parseGuestRoute(parsed.pathname || '/');
+        var pathShopSlug = guestRouteShopSlug(route);
         var hashBody = String(parsed.hash || '').replace(/^#/, '');
         var hashParams = new URLSearchParams(hashBody.charAt(0) === '?' ? hashBody : (hashBody ? '?' + hashBody : ''));
         var joinToken = (parsed.searchParams.get(JOIN_TOKEN_PARAM) || hashParams.get(JOIN_TOKEN_PARAM) || '').trim();
         if (joinToken) {
-            return { kind: 'join', joinToken: joinToken, raw: raw, url: parsed };
+            return { kind: 'join', joinToken: joinToken, raw: raw, url: parsed, pathShopSlug: pathShopSlug };
         }
         var fixed = parseFixedQrCredentialsFromSearch(parsed.search);
         if (fixed.shopId > 0 && fixed.tableNo > 0 && fixed.passPhrase) {
@@ -2393,7 +3175,19 @@
                 tableNo: fixed.tableNo,
                 passPhrase: fixed.passPhrase,
                 raw: raw,
-                url: parsed
+                url: parsed,
+                pathShopSlug: pathShopSlug
+            };
+        }
+        if (fixed.tableNo > 0 && fixed.passPhrase && pathShopSlug) {
+            return {
+                kind: 'fixed',
+                shopId: fixed.shopId > 0 ? fixed.shopId : 0,
+                tableNo: fixed.tableNo,
+                passPhrase: fixed.passPhrase,
+                raw: raw,
+                url: parsed,
+                pathShopSlug: pathShopSlug
             };
         }
         var creds = parseJoinCredentialsFromSearch(parsed.search);
@@ -2403,7 +3197,8 @@
                 sessionId: creds.sessionId,
                 pin: creds.pin,
                 raw: raw,
-                url: parsed
+                url: parsed,
+                pathShopSlug: pathShopSlug
             };
         }
         if (hashBody) {
@@ -2414,24 +3209,24 @@
                     sessionId: creds.sessionId,
                     pin: creds.pin,
                     raw: raw,
-                    url: parsed
+                    url: parsed,
+                    pathShopSlug: pathShopSlug
                 };
             }
         }
-        return { kind: 'invalid', raw: raw, url: parsed };
+        return { kind: 'invalid', raw: raw, url: parsed, pathShopSlug: pathShopSlug };
     }
 
-    function buildConnectEntryUrl(sessionId, pin) {
-        var id = sanitizeGuestSessionId(sessionId);
-        var normalizedPin = sanitizeGuestJoinPin(pin);
-        if (!id || !normalizedPin) {
+    function buildConnectEntryUrl(sessionId, pin, shopSlug) {
+        var slug = displayPathSlug(shopSlug) || String(shopSlug || '').trim();
+        if (!slug) {
             return '';
         }
-        return '/connect?id=' + encodeURIComponent(id) + '&pass=' + encodeURIComponent(normalizedPin);
+        return buildShopScopedGuestUrl(slug, sessionId, pin);
     }
 
-    function buildGuestSessionShareConnectUrl(sessionId, pin, orderPublicBase) {
-        var entry = buildConnectEntryUrl(sessionId, pin);
+    function buildGuestSessionShareConnectUrl(sessionId, pin, orderPublicBase, shopSlug) {
+        var entry = buildConnectEntryUrl(sessionId, pin, shopSlug);
         if (!entry) {
             return '';
         }
@@ -2967,6 +3762,26 @@
         };
     }
 
+    function resolveFixedQrShopId(payload, options) {
+        var shopId = payload && payload.shopId > 0 ? payload.shopId : null;
+        if (shopId == null && options && options.shopId != null && Number(options.shopId) > 0) {
+            shopId = Number(options.shopId);
+        }
+        if (shopId != null && shopId > 0) {
+            return Promise.resolve(shopId);
+        }
+        var slug = (payload && payload.pathShopSlug) || '';
+        if (!slug) {
+            return Promise.reject(new Error('店舗情報がありません。店舗のQRから開いてください。'));
+        }
+        return fetchPublicShop(slug, options && options.apiBase).then(function (shop) {
+            if (!shop || !shop.shopId) {
+                throw new Error('店舗情報を取得できませんでした');
+            }
+            return shop.shopId;
+        });
+    }
+
     function connectFromGuestQrText(sessionController, text, options) {
         options = options || {};
         var sdk = options.orderSdk || (sessionController && sessionController.sdk);
@@ -2985,30 +3800,15 @@
             });
         }
         if (payload.kind === 'fixed') {
-            if (options.useConnectEntryUrl !== false && typeof location !== 'undefined') {
-                var base = options.orderPublicBase || inferGuestOrderPublicBase();
-                var entryUrl = buildFixedQrConnectUrl(
-                    base,
-                    payload.shopId,
-                    payload.tableNo,
-                    payload.passPhrase
-                );
-                if (entryUrl && options.redirect !== false) {
-                    safeLocationReplace(entryUrl);
-                    return Promise.resolve({
-                        kind: 'fixed',
-                        needsPeoples: true,
-                        credentials: payload
-                    });
-                }
-            }
             if (options.peoples != null && Number(options.peoples) > 0) {
-                return openFixedQrSessionAndConnect(sessionController, {
-                    shopId: payload.shopId,
-                    tableNo: payload.tableNo,
-                    passPhrase: payload.passPhrase,
-                    peoples: Number(options.peoples)
-                }, options);
+                return resolveFixedQrShopId(payload, options).then(function (resolvedShopId) {
+                    return openFixedQrSessionAndConnect(sessionController, {
+                        shopId: resolvedShopId,
+                        tableNo: payload.tableNo,
+                        passPhrase: payload.passPhrase,
+                        peoples: Number(options.peoples)
+                    }, options);
+                });
             }
             return Promise.resolve({
                 kind: 'fixed',
@@ -3017,14 +3817,8 @@
             });
         }
         if (payload.kind === 'credentials') {
-            if (options.useConnectEntryUrl && typeof location !== 'undefined') {
-                var entry = buildConnectEntryUrl(payload.sessionId, payload.pin);
-                if (entry) {
-                    safeLocationReplace(entry);
-                    return Promise.resolve(null);
-                }
-            }
-            return sessionController.connect(payload.sessionId, payload.pin).then(function (detail) {
+            var scopeShopId = options.shopId != null ? options.shopId : null;
+            return sessionController.connect(payload.sessionId, payload.pin, scopeShopId).then(function (detail) {
                 if (typeof options.onConnected === 'function') {
                     return options.onConnected(detail, payload.pin);
                 }
@@ -3269,6 +4063,29 @@
             onSessionUpdate: options.onSessionUpdate
         });
         const guestFirestore = options.guestFirestore || null;
+
+        function resolveControllerShopId(shopId) {
+            if (shopId != null && shopId !== '') {
+                return shopId;
+            }
+            if (options.shopId != null && options.shopId !== '') {
+                return options.shopId;
+            }
+            if (typeof options.getShopId === 'function') {
+                return options.getShopId();
+            }
+            return null;
+        }
+
+        function shopIdMatchesHint(detailShopId, shopIdHint) {
+            if (shopIdHint == null || shopIdHint === '') {
+                return true;
+            }
+            if (detailShopId == null || detailShopId === '') {
+                return true;
+            }
+            return Number(detailShopId) === Number(shopIdHint);
+        }
         let guestFirestoreUnsub = null;
         let lastGuestDetail = null;
         var SESSION_INACTIVE_GRACE_MS = 10000;
@@ -3296,7 +4113,14 @@
         }
 
         function applyDetail(detail) {
-            saveSessionCredentials(detail.sessionId, detail.pin);
+            var meta = {
+                shopId: detail.shopId,
+                shopSlug: resolveShopPublicSlug(detail) || resolveConnectSlug(detail)
+            };
+            if (meta.shopSlug && String(meta.shopSlug).indexOf('shop-') === 0) {
+                meta.shopSlug = '';
+            }
+            saveSessionCredentials(detail.sessionId, detail.pin, meta);
             stripJoinCredentialsFromUrl();
             touchSessionActivity();
             if (typeof options.onSessionUpdate === 'function') {
@@ -3360,6 +4184,11 @@
         }
 
         function afterConnectDetail(detail, shopId) {
+            if (detail && detail.shopId != null) {
+                invalidateGuestOrderBundleCache(detail.shopId);
+            } else if (shopId != null) {
+                invalidateGuestOrderBundleCache(shopId);
+            }
             var chain = Promise.resolve(detail);
             if (guestFirestore && guestFirestore.enabled
                 && detail.firebaseCustomToken
@@ -3395,9 +4224,29 @@
 
         function connect(sessionId, pin, shopId) {
             const normalizedPin = String(pin || '').trim().toUpperCase();
-            return orderSdk.connectSessionDetail(sessionId, normalizedPin, shopId)
+            var resolvedShopId = resolveControllerShopId(shopId);
+            if (resolvedShopId == null || resolvedShopId === '') {
+                const creds = loadSessionCredentials();
+                if (creds.shopId != null && creds.shopId !== '') {
+                    resolvedShopId = creds.shopId;
+                }
+            }
+            if (resolvedShopId == null || resolvedShopId === '') {
+                return orderSdk.connectSessionDetail(sessionId, normalizedPin, null)
+                    .then(function (detail) {
+                        if (!detail || detail.shopId == null || detail.shopId === '') {
+                            return Promise.reject(new Error('店舗情報がありません。店舗のQRから開いてください。'));
+                        }
+                        return afterConnectDetail(detail, detail.shopId);
+                    });
+            }
+            return orderSdk.connectSessionDetail(sessionId, normalizedPin, resolvedShopId)
                 .then(function (detail) {
-                    return afterConnectDetail(detail, shopId);
+                    if (!shopIdMatchesHint(detail.shopId, resolvedShopId)) {
+                        clearSessionCredentials();
+                        return Promise.reject(new Error('別の店舗のセッションです。接続情報を確認してください。'));
+                    }
+                    return afterConnectDetail(detail, resolvedShopId);
                 });
         }
 
@@ -3410,18 +4259,71 @@
             if (!normalizedPin) {
                 return Promise.reject(new Error('合流には PIN が必要です'));
             }
-            return orderSdk.connectSessionViaJoinToken(token, normalizedPin, shopId)
+            const resolvedShopId = resolveControllerShopId(shopId);
+            if (resolvedShopId == null || resolvedShopId === '') {
+                return Promise.reject(new Error('店舗情報がありません。店舗のQRから開いてください。'));
+            }
+            return orderSdk.connectSessionViaJoinToken(token, normalizedPin, resolvedShopId)
                 .then(function (detail) {
-                    return afterConnectDetail(detail, shopId);
+                    if (!shopIdMatchesHint(detail.shopId, resolvedShopId)) {
+                        clearSessionCredentials();
+                        return Promise.reject(new Error('別の店舗のセッションです。接続情報を確認してください。'));
+                    }
+                    return afterConnectDetail(detail, resolvedShopId);
                 });
+        }
+
+        function credentialsMatchCurrentShop(creds) {
+            if (!creds || !creds.sessionId || !creds.pin) {
+                return false;
+            }
+            const resolvedShopId = resolveControllerShopId(null);
+            const resolvedShopSlug = typeof options.getShopSlug === 'function'
+                ? String(options.getShopSlug() || '').trim()
+                : '';
+            if (resolvedShopId != null && resolvedShopId !== '') {
+                if (creds.shopId != null && Number(creds.shopId) !== Number(resolvedShopId)) {
+                    return false;
+                }
+                if (creds.shopId == null && (resolvedShopSlug || creds.shopSlug)) {
+                    return false;
+                }
+            }
+            if (resolvedShopSlug) {
+                if (creds.shopSlug && !guestSlugMatches(resolvedShopSlug, creds.shopSlug)) {
+                    return false;
+                }
+                if (!creds.shopSlug && creds.shopId == null) {
+                    return false;
+                }
+            }
+            return true;
         }
 
         function tryAutoReconnect() {
             const creds = loadSessionCredentials();
-            if (!creds.sessionId || !creds.pin) {
+            if (!credentialsMatchCurrentShop(creds)) {
+                if (creds.sessionId || creds.pin) {
+                    clearSessionCredentials();
+                }
                 return Promise.resolve(null);
             }
-            return connect(creds.sessionId, creds.pin, options.shopId).catch(function () {
+            var resolvedShopId = resolveControllerShopId(null);
+            if ((resolvedShopId == null || resolvedShopId === '')
+                    && creds.shopId != null && creds.shopId !== '') {
+                resolvedShopId = creds.shopId;
+            }
+            if (resolvedShopId == null || resolvedShopId === '') {
+                if (!creds.sessionId || !creds.pin) {
+                    return Promise.resolve(null);
+                }
+                return connect(creds.sessionId, creds.pin, null).catch(function () {
+                    clearSessionCredentials();
+                    return null;
+                });
+            }
+            return connect(creds.sessionId, creds.pin, resolvedShopId).catch(function () {
+                clearSessionCredentials();
                 return null;
             });
         }
@@ -3458,12 +4360,19 @@
         parseSessionConnect: parseSessionConnect,
         createLocalOrderHistoryEntry: createLocalOrderHistoryEntry,
         mergeOrderHistoryWithPending: mergeOrderHistoryWithPending,
+        resolveOrderHistoryDisplayTotal: resolveOrderHistoryDisplayTotal,
         saveSessionCredentials: saveSessionCredentials,
         loadSessionCredentials: loadSessionCredentials,
+        loadGuestReconnectCredentials: loadGuestReconnectCredentials,
         clearSessionCredentials: clearSessionCredentials,
         parseJoinCredentialsFromLocation: parseJoinCredentialsFromLocation,
+        resolveGuestConnectCredentials: resolveGuestConnectCredentials,
         parseJoinTokenFromLocation: parseJoinTokenFromLocation,
         stashJoinCredentialsForRoute: stashJoinCredentialsForRoute,
+        stashPendingConnectDetail: stashPendingConnectDetail,
+        takePendingConnectDetail: takePendingConnectDetail,
+        isOnCorrectGuestTemplate: isOnCorrectGuestTemplate,
+        isSameGuestNavigationTarget: isSameGuestNavigationTarget,
         buildOrderJoinUrl: buildOrderJoinUrl,
         buildOrderJoinUrlFromToken: buildOrderJoinUrlFromToken,
         buildFixedQrConnectUrl: buildFixedQrConnectUrl,
@@ -3485,9 +4394,22 @@
         MAX_MENU_UNITS_PER_GUEST_ORDER: MAX_MENU_UNITS_PER_GUEST_ORDER,
         guestUrl: guestUrlApi,
         parseGuestRoute: parseGuestRoute,
+        isShopScopedGuestRoute: isShopScopedGuestRoute,
+        guestRouteShopSlug: guestRouteShopSlug,
+        buildShopScopedScanPath: buildShopScopedScanPath,
+        buildShopScopedGuestPath: buildShopScopedGuestPath,
+        buildShopScopedGuestUrl: buildShopScopedGuestUrl,
+        buildShopScopedScanUrl: buildShopScopedScanUrl,
+        GUEST_SCAN_PATH: GUEST_SCAN_PATH,
+        GUEST_SHOP_PATH_PREFIX: GUEST_SHOP_PATH_PREFIX,
+        buildShopPublicUrl: buildShopPublicUrl,
+        resolveShopPublicSlug: resolveShopPublicSlug,
+        guestSlugMatches: guestSlugMatches,
         stripLegacyMoQueryParams: stripLegacyMoQueryParams,
         buildConnectShopUrl: buildConnectShopUrl,
         guestLocationReplace: guestLocationReplace,
+        /** @deprecated use guestLocationReplace — kept for legacy Order HTML */
+        safeLocationReplace: guestLocationReplace,
         enrichConnectDetailWithOpenMeta: enrichConnectDetailWithOpenMeta,
         buildConnectEntryUrl: buildConnectEntryUrl,
         buildGuestSessionShareConnectUrl: buildGuestSessionShareConnectUrl,
@@ -3532,14 +4454,14 @@
         GUEST_MENU_LANG_DEFAULT: GUEST_MENU_LANG_DEFAULT,
         GUEST_MENU_LANG_LABELS: GUEST_MENU_LANG_LABELS,
         resolveGuestMenuDisplayName: resolveGuestMenuDisplayName,
+        resolveGuestMenuDisplayPrice: resolveGuestMenuDisplayPrice,
+        findGuestCartPriceDrift: findGuestCartPriceDrift,
+        reconcileGuestCartPrices: reconcileGuestCartPrices,
+        isGuestOrderPriceStaleError: isGuestOrderPriceStaleError,
         formatOrderHistoryLines: formatOrderHistoryLines
     };
 
     global.MasterOrderGuestUrl = guestUrlApi;
     global.MasterOrderOrderSdk = orderApi;
     global.MasterOrderSdk = orderApi;
-
-    if (typeof location !== 'undefined') {
-        stripLegacyMoQueryParams();
-    }
 })(typeof window !== 'undefined' ? window : globalThis);

@@ -76,11 +76,12 @@
     }
 
     /**
-     * @param {{ getShopId: function(): *, getOrderPublicBase: function(): string, isSessionsTabActive?: function(): boolean, qrPx?: number }} options
+     * @param {{ getShopId: function(): *, getShopSlug?: function(): string, getOrderPublicBase: function(): string, isSessionsTabActive?: function(): boolean, qrPx?: number }} options
      */
     function createStaffQrService(options) {
         options = options || {};
         var getShopId = options.getShopId;
+        var getShopSlug = options.getShopSlug;
         var getOrderPublicBase = options.getOrderPublicBase;
         var isSessionsTabActive = typeof options.isSessionsTabActive === 'function'
             ? options.isSessionsTabActive
@@ -101,33 +102,90 @@
         var fixedQrIntersectionObserver = null;
         var tableSeatQrFinalizeTimer = null;
 
-        function buildOrderJoinUrl(sessionId, entryPin, joinToken) {
-            var base = typeof getOrderPublicBase === 'function' ? getOrderPublicBase() : '';
-            if (!base) {
+        var GUEST_SHOP_PATH_PREFIX = '/Shop';
+
+        function normalizeGuestOrderOrigin(base) {
+            var raw = String(base || '').trim();
+            if (!raw) {
                 return '';
             }
-            var connectBase = base.replace(/\/$/, '') + '/connect';
-            if (!sessionId || !entryPin) {
+            try {
+                var url = new URL(raw.indexOf('://') >= 0 ? raw : 'https://' + raw);
+                var path = url.pathname.replace(/\/+$/, '');
+                if (/^\/(index2|index2\.html|index|index\.html|connect|scan)$/i.test(path)) {
+                    path = '';
+                }
+                return url.origin + (path || '');
+            } catch (_ignored) {
+                return raw.replace(/\/(index2|index2\.html|index|connect|scan)\/?$/i, '');
+            }
+        }
+
+        function buildShopScopedGuestPath(shopSlug) {
+            var slug = String(shopSlug || '').trim();
+            if (!slug) {
                 return '';
+            }
+            return GUEST_SHOP_PATH_PREFIX + '/' + encodeURIComponent(slug) + '/';
+        }
+
+        function buildShopScopedGuestUrl(shopSlug, sessionId, entryPin) {
+            var path = buildShopScopedGuestPath(shopSlug);
+            if (!path || !sessionId || !entryPin) {
+                return path;
             }
             var params = new URLSearchParams();
             params.set('id', String(sessionId).trim());
             params.set('pass', String(entryPin).trim().toUpperCase());
-            return connectBase + '?' + params.toString();
+            return path + '?' + params.toString();
+        }
+
+        function buildShopScopedScanPath(shopSlug) {
+            return buildShopScopedGuestPath(shopSlug);
+        }
+
+        function buildShopScopedScanUrl(shopSlug, sessionId, entryPin) {
+            return buildShopScopedGuestUrl(shopSlug, sessionId, entryPin);
+        }
+
+        function buildOrderJoinUrl(sessionId, entryPin, joinToken) {
+            var base = normalizeGuestOrderOrigin(
+                typeof getOrderPublicBase === 'function' ? getOrderPublicBase() : ''
+            );
+            if (!base) {
+                return '';
+            }
+            var shopSlug = typeof getShopSlug === 'function' ? String(getShopSlug() || '').trim() : '';
+            if (!shopSlug) {
+                return '';
+            }
+            var sid = String(sessionId || '').trim();
+            var pin = String(entryPin || '').trim().toUpperCase();
+            if (sid && pin) {
+                return base.replace(/\/$/, '') + buildShopScopedGuestUrl(shopSlug, sid, pin);
+            }
+            var token = String(joinToken || '').trim();
+            if (token) {
+                var joinParams = new URLSearchParams();
+                joinParams.set('join', token);
+                return base.replace(/\/$/, '') + buildShopScopedGuestPath(shopSlug) + '?' + joinParams.toString();
+            }
+            return base.replace(/\/$/, '') + buildShopScopedGuestPath(shopSlug);
         }
 
         function buildFixedQrConnectUrl(tableNo, passPhrase) {
-            var base = typeof getOrderPublicBase === 'function' ? getOrderPublicBase() : '';
-            var shopId = typeof getShopId === 'function' ? getShopId() : null;
-            if (!base || !shopId || !tableNo || !passPhrase) {
+            var base = normalizeGuestOrderOrigin(
+                typeof getOrderPublicBase === 'function' ? getOrderPublicBase() : ''
+            );
+            var shopSlug = typeof getShopSlug === 'function' ? String(getShopSlug() || '').trim() : '';
+            if (!base || !shopSlug || !tableNo || !passPhrase) {
                 return '';
             }
-            var connectBase = base.replace(/\/$/, '') + '/connect';
+            var path = buildShopScopedGuestPath(shopSlug);
             var params = new URLSearchParams();
-            params.set('shopId', String(shopId));
             params.set('tableNo', String(tableNo));
             params.set('passPhrase', String(passPhrase).trim());
-            return connectBase + '?' + params.toString();
+            return base.replace(/\/$/, '') + path + '?' + params.toString();
         }
 
         function sessionQrCacheKey(sessionId, entryPin) {
@@ -161,6 +219,7 @@
                 return;
             }
             qrWrap.classList.remove('session-qr-wrap--loading');
+            qrWrap.classList.remove('table-seat-action-qr--loading');
             var nodes = qrWrap.querySelectorAll('.session-qr-loading');
             var i;
             for (i = 0; i < nodes.length; i++) {
@@ -177,43 +236,102 @@
             qrWrap.appendChild(createSessionQrLoadingEl());
         }
 
-        function generateSessionQrDataUrl(url) {
-            var QRCodeLib = global.QRCode;
-            if (!url || typeof QRCodeLib === 'undefined' || typeof QRCodeLib.CorrectLevel === 'undefined') {
+        function resolveQrCorrectLevel(QRCodeLib) {
+            if (QRCodeLib && QRCodeLib.CorrectLevel && typeof QRCodeLib.CorrectLevel.M !== 'undefined') {
+                return QRCodeLib.CorrectLevel.M;
+            }
+            return 0;
+        }
+
+        function extractQrDataUrlFromHolder(holder) {
+            if (!holder) {
                 return '';
             }
+            var canvas = holder.querySelector('canvas');
+            if (canvas && canvas.width > 0 && canvas.height > 0) {
+                try {
+                    var fromCanvas = canvas.toDataURL('image/png');
+                    if (fromCanvas && fromCanvas.length > 64) {
+                        return fromCanvas;
+                    }
+                } catch (_canvasErr) {
+                    /* fall through */
+                }
+            }
+            var tableEl = holder.querySelector('table');
+            if (tableEl) {
+                var fromTable = tableQrToDataUrl(tableEl, qrPx, qrPx);
+                if (fromTable && fromTable.length > 64) {
+                    return fromTable;
+                }
+            }
+            var innerImg = holder.querySelector('img');
+            if (innerImg && innerImg.src && innerImg.src.indexOf('data:image') === 0 && innerImg.src.length > 64) {
+                return innerImg.src;
+            }
+            return '';
+        }
+
+        function createQrRenderHolder() {
             var holder = document.createElement('div');
             holder.setAttribute('aria-hidden', 'true');
-            holder.style.cssText = 'position:fixed;left:0;top:0;width:' + qrPx + 'px;height:'
-                + qrPx + 'px;overflow:hidden;opacity:0;visibility:hidden;pointer-events:none;clip:rect(0,0,0,0);';
-            document.body.appendChild(holder);
+            holder.style.cssText = 'position:fixed;left:-10000px;top:0;width:' + qrPx + 'px;height:'
+                + qrPx + 'px;overflow:hidden;opacity:0;pointer-events:none;';
+            return holder;
+        }
+
+        function renderQrIntoHolder(holder, QRCodeLib, qrOptions, forceTableMode) {
+            var savedCtx = global.CanvasRenderingContext2D;
+            if (forceTableMode && savedCtx) {
+                try {
+                    delete global.CanvasRenderingContext2D;
+                } catch (_deleteErr) {
+                    global.CanvasRenderingContext2D = undefined;
+                }
+            }
             try {
-                new QRCodeLib(holder, {
-                    text: url,
-                    width: qrPx,
-                    height: qrPx,
-                    colorDark: '#000000',
-                    colorLight: '#ffffff',
-                    correctLevel: QRCodeLib.CorrectLevel.M
-                });
-                var canvas = holder.querySelector('canvas');
-                if (canvas && canvas.width > 0) {
-                    return canvas.toDataURL('image/png');
+                new QRCodeLib(holder, qrOptions);
+                return extractQrDataUrlFromHolder(holder);
+            } finally {
+                if (forceTableMode && savedCtx) {
+                    global.CanvasRenderingContext2D = savedCtx;
                 }
-                var tableEl = holder.querySelector('table');
-                if (tableEl) {
-                    return tableQrToDataUrl(tableEl, qrPx, qrPx);
-                }
-                var innerImg = holder.querySelector('img');
-                if (innerImg && innerImg.src && innerImg.src.indexOf('data:image') === 0) {
-                    return innerImg.src;
+            }
+        }
+
+        function generateQrDataUrlFromText(text) {
+            var QRCodeLib = global.QRCode;
+            var payload = String(text || '').trim();
+            if (!payload || typeof QRCodeLib !== 'function') {
+                return '';
+            }
+            var qrOptions = {
+                text: payload,
+                width: qrPx,
+                height: qrPx,
+                colorDark: '#000000',
+                colorLight: '#ffffff',
+                correctLevel: resolveQrCorrectLevel(QRCodeLib)
+            };
+            var holder = createQrRenderHolder();
+            document.body.appendChild(holder);
+            var dataUrl = '';
+            try {
+                dataUrl = renderQrIntoHolder(holder, QRCodeLib, qrOptions, true);
+                if (!dataUrl) {
+                    holder.replaceChildren();
+                    dataUrl = renderQrIntoHolder(holder, QRCodeLib, qrOptions, false);
                 }
             } catch (_qrErr) {
-                return '';
+                dataUrl = '';
             } finally {
                 holder.remove();
             }
-            return '';
+            return dataUrl;
+        }
+
+        function generateSessionQrDataUrl(url) {
+            return generateQrDataUrlFromText(url);
         }
 
         function applySessionQrToElements(imgEl, captionEl, dataUrl) {
@@ -244,10 +362,30 @@
                 return;
             }
             if (sessionCardQrQueuedKeys.has(cacheKey)) {
+                if (sessionQrCache.has(cacheKey)) {
+                    applySessionQrToElements(job.imgEl, job.captionEl, sessionQrCache.get(cacheKey));
+                }
                 return;
             }
             sessionCardQrQueuedKeys.add(cacheKey);
-            sessionCardQrLoadQueue.push(Object.assign({}, job, { cacheKey: cacheKey }));
+            var queuedJob = Object.assign({}, job, { cacheKey: cacheKey });
+            var tableNo = Number(queuedJob.tableNo || 0);
+            if (Number.isFinite(tableNo) && tableNo > 0) {
+                queuedJob.tableNo = tableNo;
+            } else {
+                queuedJob.tableNo = 0;
+            }
+            var insertAt = sessionCardQrLoadQueue.length;
+            if (queuedJob.tableNo > 0) {
+                for (var i = 0; i < sessionCardQrLoadQueue.length; i += 1) {
+                    var existingTableNo = Number(sessionCardQrLoadQueue[i] && sessionCardQrLoadQueue[i].tableNo || 0);
+                    if ((existingTableNo <= 0) || existingTableNo > queuedJob.tableNo) {
+                        insertAt = i;
+                        break;
+                    }
+                }
+            }
+            sessionCardQrLoadQueue.splice(insertAt, 0, queuedJob);
             if (sessionCardQrPumpScheduled) {
                 return;
             }
@@ -324,43 +462,7 @@
         }
 
         function generateFixedQrDataUrl(tableNo, passPhrase) {
-            var url = buildFixedQrConnectUrl(tableNo, passPhrase);
-            var QRCodeLib = global.QRCode;
-            if (!url || typeof QRCodeLib === 'undefined' || typeof QRCodeLib.CorrectLevel === 'undefined') {
-                return '';
-            }
-            var holder = document.createElement('div');
-            holder.setAttribute('aria-hidden', 'true');
-            holder.style.cssText = 'position:fixed;left:0;top:0;width:' + qrPx + 'px;height:'
-                + qrPx + 'px;overflow:hidden;opacity:0;visibility:hidden;pointer-events:none;';
-            document.body.appendChild(holder);
-            try {
-                new QRCodeLib(holder, {
-                    text: url,
-                    width: qrPx,
-                    height: qrPx,
-                    colorDark: '#000000',
-                    colorLight: '#ffffff',
-                    correctLevel: QRCodeLib.CorrectLevel.M
-                });
-                var canvas = holder.querySelector('canvas');
-                if (canvas && canvas.width > 0) {
-                    return canvas.toDataURL('image/png');
-                }
-                var tableEl = holder.querySelector('table');
-                if (tableEl) {
-                    return tableQrToDataUrl(tableEl, qrPx, qrPx);
-                }
-                var innerImg = holder.querySelector('img');
-                if (innerImg && innerImg.src && innerImg.src.indexOf('data:image') === 0) {
-                    return innerImg.src;
-                }
-            } catch (_qrErr) {
-                return '';
-            } finally {
-                holder.remove();
-            }
-            return '';
+            return generateQrDataUrlFromText(buildFixedQrConnectUrl(tableNo, passPhrase));
         }
 
         function applyFixedQrToWrap(qrWrap, qrImg, qrCaption, tableNo, passPhrase) {
@@ -377,7 +479,16 @@
                 qrImg.style.display = 'none';
                 qrImg.removeAttribute('src');
                 if (qrCaption) {
-                    qrCaption.style.display = 'none';
+                    qrCaption.style.display = '';
+                    qrCaption.style.visibility = '';
+                    var fixedUrl = buildFixedQrConnectUrl(tableNo, passPhrase);
+                    if (!fixedUrl) {
+                        qrCaption.textContent = '来客URLを組み立てできません';
+                    } else if (typeof global.QRCode === 'undefined') {
+                        qrCaption.textContent = 'QRライブラリを読み込めません';
+                    } else {
+                        qrCaption.textContent = 'QRを生成できません';
+                    }
                 }
                 return false;
             }
@@ -567,24 +678,45 @@
             });
         }
 
-        function renderSessionQrInto(imgEl, sessionId, entryPin, captionEl, joinToken) {
+        function renderSessionQrInto(imgEl, sessionId, entryPin, captionEl, joinToken, tableNo, options) {
             if (!imgEl) {
-                return;
+                return false;
             }
-            var url = buildOrderJoinUrl(sessionId, entryPin, joinToken);
+            options = options || {};
+            var url = (options.url && String(options.url).trim())
+                ? String(options.url).trim()
+                : buildOrderJoinUrl(sessionId, entryPin, joinToken);
             if (!url) {
                 imgEl.style.display = 'none';
                 imgEl.removeAttribute('src');
                 if (captionEl) {
-                    captionEl.style.display = 'none';
+                    captionEl.style.display = '';
+                    captionEl.style.visibility = '';
+                    captionEl.textContent = '来客URLを組み立てできません';
                 }
-                return;
+                return false;
             }
             var cacheKey = sessionQrCacheKey(sessionId, entryPin);
             var cachedDataUrl = sessionQrCache.get(cacheKey);
             if (cachedDataUrl) {
-                applySessionQrToElements(imgEl, captionEl, cachedDataUrl);
-                return;
+                return applySessionQrToElements(imgEl, captionEl, cachedDataUrl);
+            }
+            if (options.immediate === true) {
+                var immediateDataUrl = generateSessionQrDataUrl(url);
+                if (!immediateDataUrl) {
+                    imgEl.style.display = 'none';
+                    imgEl.removeAttribute('src');
+                    if (captionEl) {
+                        captionEl.style.display = '';
+                        captionEl.style.visibility = '';
+                        captionEl.textContent = typeof global.QRCode === 'undefined'
+                            ? 'QRライブラリを読み込めません'
+                            : 'QRを生成できません';
+                    }
+                    return false;
+                }
+                sessionQrCache.set(cacheKey, immediateDataUrl);
+                return applySessionQrToElements(imgEl, captionEl, immediateDataUrl);
             }
             imgEl.style.visibility = 'hidden';
             if (captionEl) {
@@ -596,8 +728,10 @@
                 sessionId: sessionId,
                 entryPin: entryPin,
                 cacheKey: cacheKey,
-                url: url
+                url: url,
+                tableNo: Number(tableNo || 0)
             });
+            return true;
         }
 
         function renderFixedQrInto(imgEl, tableNo, passPhrase, captionEl) {
@@ -638,6 +772,13 @@
             sessionQrCacheKey: sessionQrCacheKey,
             fixedQrCacheKey: fixedQrCacheKey,
             renderSessionQrInto: renderSessionQrInto,
+            renderSessionQrIntoImmediate: function (imgEl, sessionId, entryPin, captionEl, joinToken, tableNo, urlOverride) {
+                var opts = { immediate: true };
+                if (urlOverride && String(urlOverride).trim()) {
+                    opts.url = String(urlOverride).trim();
+                }
+                return renderSessionQrInto(imgEl, sessionId, entryPin, captionEl, joinToken, tableNo, opts);
+            },
             renderFixedQrInto: renderFixedQrInto,
             applyFixedQrToWrap: applyFixedQrToWrap,
             scheduleLazyFixedQrForCard: scheduleLazyFixedQrForCard,
