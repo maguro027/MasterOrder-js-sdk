@@ -5,7 +5,8 @@
  * グローバル: MasterOrderGuestFirestoreSdk
  *
  * PIN 成功 → Server が発行した Custom Token で signIn 後、
- * {@code shops/{shopId}/active_sessions/{sessionId}/orders} を購読する。
+ * {@code shops/{shopPublicId}/active_sessions/{sessionId}/orders} を購読する。
+ * shopPublicId / moShopId は UUID（内部 shops.id ではない）。
  * 書き込みは Server API のみ。
  */
 (function (global) {

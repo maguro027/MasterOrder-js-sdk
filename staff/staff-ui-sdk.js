@@ -12,10 +12,14 @@
     var FIRESTORE_RATE_LIMIT_MESSAGE =
         'Firestore レート制限中です。しばらく待ってから再試行してください。';
 
+    var HTTP_RATE_LIMIT_MESSAGE =
+        '操作が早すぎます。しばらく待ってからもう一度お試しください。';
+
     var PENDING_ORDERS_SORT_WAIT_DESC = 'wait-desc';
     var PENDING_ORDERS_SORT_WAIT_ASC = 'wait-asc';
 
     var FIRESTORE_BACKOFF_MS = 120000;
+    var HTTP_RATE_LIMIT_BACKOFF_MS = 15000;
 
     function createFirestoreBackoff() {
         var firestoreBackoffUntil = 0;
@@ -45,6 +49,90 @@
         };
     }
 
+    function createHttpRateLimitBackoff() {
+        var until = 0;
+        function mark(err) {
+            if (isHttpRateLimited(err)) {
+                until = Date.now() + HTTP_RATE_LIMIT_BACKOFF_MS;
+            }
+        }
+        function isActive() {
+            return Date.now() < until;
+        }
+        return { mark: mark, isActive: isActive };
+    }
+
+    function isHttpRateLimited(err) {
+        if (!err) {
+            return false;
+        }
+        if (Number(err.status) === 429) {
+            return true;
+        }
+        var core = global.MasterOrderCoreSdk;
+        if (core && typeof core.isRateLimitFailure === 'function') {
+            return core.isRateLimitFailure(err);
+        }
+        var code = err.payload && err.payload.code ? String(err.payload.code) : '';
+        if (code === 'RATE_LIMITED' || code === 'EDGE_BLOCKED') {
+            return true;
+        }
+        var parts = [err.message];
+        if (err.payload && typeof err.payload === 'object') {
+            parts.push(err.payload.message, err.payload.error, err.payload.detail);
+        }
+        return /too many requests|rate.?limited|操作が早すぎ|リクエスト数の上限|リクエストが多すぎ/i
+            .test(parts.filter(Boolean).join(' '));
+    }
+
+    function extractProblemDetailMessage(raw) {
+        if (raw == null) {
+            return '';
+        }
+        var text = String(raw).trim();
+        if (!text) {
+            return '';
+        }
+        if (text.charAt(0) === '{' && (text.indexOf('"detail"') >= 0 || text.indexOf('"message"') >= 0)) {
+            try {
+                var parsed = JSON.parse(text);
+                if (parsed && typeof parsed === 'object') {
+                    if (parsed.message != null && String(parsed.message).trim()) {
+                        return String(parsed.message).trim();
+                    }
+                    if (parsed.detail != null && String(parsed.detail).trim()) {
+                        return String(parsed.detail).trim();
+                    }
+                    if (parsed.title != null && String(parsed.title).trim()) {
+                        return String(parsed.title).trim();
+                    }
+                }
+            } catch (_parseErr) {
+                // keep original text
+            }
+        }
+        return text;
+    }
+
+    var UNKNOWN_PROBLEM_MESSAGE = '未知の問題が発生しました';
+
+    function logStaffError(context, err) {
+        if (typeof console !== 'undefined' && typeof console.debug === 'function') {
+            console.debug('[staff]', context || 'error', err);
+        }
+    }
+
+    function staffUserVisibleLoadError(err, fallback, backoff) {
+        logStaffError('load', err);
+        var rateLimitCheck = backoff && typeof backoff.isRateLimitError === 'function'
+            ? backoff.isRateLimitError
+            : createFirestoreBackoff().isRateLimitError;
+        if (rateLimitCheck(err) || isHttpRateLimited(err)) {
+            return formatStaffApiError(err, fallback || UNKNOWN_PROBLEM_MESSAGE, backoff);
+        }
+        return fallback || UNKNOWN_PROBLEM_MESSAGE;
+    }
+
     function formatStaffApiError(err, fallback, backoff) {
         var rateLimitCheck = backoff && typeof backoff.isRateLimitError === 'function'
             ? backoff.isRateLimitError
@@ -52,7 +140,23 @@
         if (rateLimitCheck(err)) {
             return FIRESTORE_RATE_LIMIT_MESSAGE;
         }
-        var msg = err && (err.message || err.detail) ? String(err.message || err.detail) : '';
+        if (isHttpRateLimited(err)) {
+            var serverMsg = '';
+            if (err && err.payload && err.payload.message) {
+                serverMsg = String(err.payload.message).trim();
+            }
+            if (!serverMsg && err && err.message) {
+                serverMsg = extractProblemDetailMessage(err.message);
+            }
+            if (serverMsg && /早すぎ|多すぎ|上限|rate|too many/i.test(serverMsg)) {
+                return serverMsg;
+            }
+            return HTTP_RATE_LIMIT_MESSAGE;
+        }
+        if (err && err.detail != null && String(err.detail).trim()) {
+            return String(err.detail).trim();
+        }
+        var msg = err && err.message ? extractProblemDetailMessage(err.message) : '';
         return msg || fallback || '不明なエラー';
     }
 
@@ -120,6 +224,10 @@
 
     function yen(value) {
         return '\u00A5' + Number(value || 0).toLocaleString();
+    }
+
+    function yenTaxIncluded(value) {
+        return yen(value);
     }
 
     /**
@@ -246,7 +354,9 @@
             var lineIndex = item.lineIndex != null ? Number(item.lineIndex) : idx;
             var remaining = item.remainingQuantity != null
                 ? Number(item.remainingQuantity)
-                : Math.max(0, Number(item.quantity || 0) - Number(item.servedQuantity || 0));
+                : Math.max(0, Number(item.quantity || 0)
+                    - Number(item.servedQuantity || 0)
+                    - Number(item.cancelledQuantity || 0));
             if (!Number.isFinite(remaining) || remaining <= 0) {
                 return;
             }
@@ -259,6 +369,7 @@
                 menuName: item.menuName || '不明',
                 quantity: Number(item.quantity || 0),
                 servedQuantity: Number(item.servedQuantity || 0),
+                cancelledQuantity: Number(item.cancelledQuantity || 0),
                 remainingQuantity: remaining,
                 unitPrice: Number(item.unitPrice || 0),
                 toppings: Array.isArray(item.toppings) ? item.toppings : []
@@ -343,8 +454,8 @@
                     String(seat.status || '').toUpperCase(),
                     String(seat.currentSessionId || ''),
                     String(seat.activePeoples != null ? seat.activePeoples : ''),
-                    String(seat.entryPin || ''),
-                    String(seat.joinToken || '')
+                    String(seat.entryPin ? '1' : '0'),
+                    String(seat.joinToken ? '1' : '0')
                 ].join('|');
             };
         return tables.slice()
@@ -468,8 +579,13 @@
         FIRESTORE_RATE_LIMIT_MESSAGE: FIRESTORE_RATE_LIMIT_MESSAGE,
         PENDING_ORDERS_SORT_WAIT_DESC: PENDING_ORDERS_SORT_WAIT_DESC,
         PENDING_ORDERS_SORT_WAIT_ASC: PENDING_ORDERS_SORT_WAIT_ASC,
+        HTTP_RATE_LIMIT_MESSAGE: HTTP_RATE_LIMIT_MESSAGE,
         createFirestoreBackoff: createFirestoreBackoff,
+        createHttpRateLimitBackoff: createHttpRateLimitBackoff,
         formatStaffApiError: formatStaffApiError,
+        staffUserVisibleLoadError: staffUserVisibleLoadError,
+        UNKNOWN_PROBLEM_MESSAGE: UNKNOWN_PROBLEM_MESSAGE,
+        isHttpRateLimited: isHttpRateLimited,
         promiseWithTimeout: promiseWithTimeout,
         createSessionLoadStatusController: createSessionLoadStatusController,
         sortPendingOrders: sortPendingOrders,
@@ -477,6 +593,7 @@
         formatElapsed: formatElapsed,
         formatOrderTime: formatOrderTime,
         yen: yen,
+        yenTaxIncluded: yenTaxIncluded,
         mergeMenusWithInventory: mergeMenusWithInventory,
         isMenuSoldOut: isMenuSoldOut,
         groupPendingOrdersByTable: groupPendingOrdersByTable,

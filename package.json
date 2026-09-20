@@ -1,15 +1,25 @@
 {
   "name": "@waterpunch/masterorder-js-sdk",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "description": "MasterOrder browser SDK — Core / Order / Staff layers",
   "files": [
     "sdk-manifest.json",
     "core/",
     "order/",
-    "staff/"
+    "staff/",
+    "printer/"
   ],
   "scripts": {
-    "verify": "node scripts/verify-layout.js"
+    "verify": "node scripts/verify-layout.js",
+    "test:security": "node scripts/staff-pii-cache-security-contract.mjs && node scripts/guest-url-credential-security-contract.mjs && node scripts/staff-archive-cache-security-contract.mjs",
+    "test:staff-qr": "node scripts/staff-qr-scan-contract.mjs",
+    "test:party-flags": "node scripts/party-flags-contract.mjs",
+    "build": "node ../scripts/bundle-order-js.mjs && node ../scripts/bundle-staff-js.mjs",
+    "build:size": "node ../scripts/report-sdk-bundle-size.mjs",
+    "build:size:check": "node ../scripts/report-sdk-bundle-size.mjs --check"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.5"
   }
 }

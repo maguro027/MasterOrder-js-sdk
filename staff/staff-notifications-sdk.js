@@ -7,13 +7,20 @@
 (function (global) {
     'use strict';
 
-    var SDK_VERSION = '1.0.1';
+    var SDK_VERSION = '1.0.2';
     var TYPE_SHOP_INVITE = 'SHOP_INVITE';
+    var TYPE_SESSION_STALE_WARN = 'SESSION_STALE_WARN';
+    var TYPE_SHOP_POLICY_WARN = 'SHOP_POLICY_WARN';
+    var TYPE_GUEST_BAN_REQUEST = 'GUEST_BAN_REQUEST';
+    var TYPE_DISCOUNT_PRESET_REQUEST = 'DISCOUNT_PRESET_REQUEST';
     var INTERACTION_READ_ONLY = 'READ_ONLY';
     var INTERACTION_APPROVE_DENY = 'APPROVE_DENY';
-    var POLL_MS = 30000;
+    var POLL_MS = 60000;
+    var POLL_MS_HIDDEN = 180000;
     var DISMISSED_STORAGE_PREFIX = 'mo_staff_dismissed_notifications:';
     var READ_ONLY_ID_PREFIX = 'read-only:';
+    var GUEST_BAN_REQUEST_ID_PREFIX = 'guest-ban-request:';
+    var DISCOUNT_PRESET_REQUEST_ID_PREFIX = 'discount-preset-request:';
 
     function dismissedStorageKey(userId) {
         var uid = String(userId || '').trim();
@@ -66,6 +73,17 @@
         return month + '月' + day + '日 ' + hour + '時' + minute + '分';
     }
 
+    function visibleError(err, fallback) {
+        var ui = global.MasterOrderStaffUiSdk;
+        if (ui && typeof ui.staffUserVisibleLoadError === 'function') {
+            return ui.staffUserVisibleLoadError(err, fallback);
+        }
+        if (typeof global.staffUserVisibleLoadError === 'function') {
+            return global.staffUserVisibleLoadError(err, fallback);
+        }
+        return fallback || '未知の問題が発生しました';
+    }
+
     function shopDisplayName(name) {
         var trimmed = String(name || '').trim();
         if (!trimmed) {
@@ -107,6 +125,22 @@
         }
         if (notification.type === TYPE_SHOP_INVITE) {
             return buildInviteMessage(notification);
+        }
+        if (notification.type === TYPE_SESSION_STALE_WARN) {
+            return String(notification.message || '').trim()
+                || '長時間会計されていないセッションがあります。ご確認ください';
+        }
+        if (notification.type === TYPE_SHOP_POLICY_WARN) {
+            return String(notification.message || '').trim()
+                || '店舗に運営から警告が付いています。ポリシーをご確認ください';
+        }
+        if (notification.type === TYPE_GUEST_BAN_REQUEST) {
+            return String(notification.message || '').trim()
+                || 'いたずら注文の店舗出禁申請があります。許可すると対象端末は店舗出禁になります';
+        }
+        if (notification.type === TYPE_DISCOUNT_PRESET_REQUEST) {
+            return String(notification.message || '').trim()
+                || 'クーポンの条件外適用申請があります。許可するとセッションへ適用されます';
         }
         return String(notification.message || notification.title || 'お知らせ');
     }
@@ -169,10 +203,8 @@
                 if (!item || !item.id) {
                     return false;
                 }
-                if (isReadOnlyNotificationId(item.id)) {
-                    return !dismissed[item.id];
-                }
-                return true;
+                // 消去／対応済みは poll で復活させない
+                return !dismissed[item.id];
             });
         }
 
@@ -224,12 +256,19 @@
             notifyChanged();
         }
 
-        function persistReadOnlyDismiss(notificationId) {
-            if (!isReadOnlyNotificationId(notificationId)) {
+        function persistDismissed(notificationId) {
+            if (!notificationId) {
                 return;
             }
             dismissed[notificationId] = Date.now();
             saveDismissedIds(storageUserId, dismissed);
+        }
+
+        function persistReadOnlyDismiss(notificationId) {
+            if (!isReadOnlyNotificationId(notificationId)) {
+                return;
+            }
+            persistDismissed(notificationId);
         }
 
         function renderList() {
@@ -271,7 +310,13 @@
                     allowBtn.disabled = isResponding;
                     allowBtn.addEventListener('click', function (ev) {
                         ev.stopPropagation();
-                        void respondInvite(notification, true);
+                        if (notification.type === TYPE_GUEST_BAN_REQUEST) {
+                            void respondGuestBanRequest(notification, true);
+                        } else if (notification.type === TYPE_DISCOUNT_PRESET_REQUEST) {
+                            void respondDiscountPresetRequest(notification, true);
+                        } else {
+                            void respondInvite(notification, true);
+                        }
                     });
 
                     var denyBtn = document.createElement('button');
@@ -281,7 +326,13 @@
                     denyBtn.disabled = isResponding;
                     denyBtn.addEventListener('click', function (ev) {
                         ev.stopPropagation();
-                        void respondInvite(notification, false);
+                        if (notification.type === TYPE_GUEST_BAN_REQUEST) {
+                            void respondGuestBanRequest(notification, false);
+                        } else if (notification.type === TYPE_DISCOUNT_PRESET_REQUEST) {
+                            void respondDiscountPresetRequest(notification, false);
+                        } else {
+                            void respondInvite(notification, false);
+                        }
                     });
 
                     actions.appendChild(allowBtn);
@@ -320,7 +371,7 @@
                 persistReadOnlyDismiss(notification.id);
                 removeFromUi(notification.id);
             } catch (e) {
-                toast('通知の消去に失敗: ' + (e && e.message ? e.message : String(e)), 'error');
+                toast(visibleError(e, '通知の消去に失敗しました'), 'error');
             }
         }
 
@@ -341,6 +392,7 @@
             renderList();
             try {
                 await apiFn.call(clientSdk, shopId);
+                persistDismissed(notification.id);
                 toast(
                     shopDisplayName(notification.shopName) + (allow ? 'への参加を許可しました' : 'への招待を拒否しました'),
                     'ok'
@@ -350,7 +402,97 @@
                     await opts.onShopListRefresh();
                 }
             } catch (e) {
-                toast((allow ? '許可' : '拒否') + 'に失敗: ' + (e && e.message ? e.message : String(e)), 'error');
+                toast(visibleError(e, (allow ? '許可' : '拒否') + 'に失敗しました'), 'error');
+            } finally {
+                respondingId = null;
+                renderList();
+            }
+        }
+
+        function guestBanRequestIdFromNotification(notification) {
+            var id = String(notification && notification.id || '');
+            if (id.indexOf(GUEST_BAN_REQUEST_ID_PREFIX) !== 0) {
+                return '';
+            }
+            return id.slice(GUEST_BAN_REQUEST_ID_PREFIX.length).trim();
+        }
+
+        async function respondGuestBanRequest(notification, allow) {
+            if (!clientSdk || !notification || notification.shopId == null) {
+                return;
+            }
+            if (respondingId) {
+                return;
+            }
+            var requestId = guestBanRequestIdFromNotification(notification);
+            if (!requestId) {
+                toast('出禁申請 ID が不正です', 'error');
+                return;
+            }
+            var apiFn = allow ? clientSdk.approveGuestBanRequest : clientSdk.denyGuestBanRequest;
+            if (typeof apiFn !== 'function') {
+                toast('通知 API が利用できません', 'error');
+                return;
+            }
+            respondingId = notification.id;
+            renderList();
+            try {
+                await apiFn.call(clientSdk, notification.shopId, requestId);
+                persistDismissed(notification.id);
+                toast(
+                    allow
+                        ? (shopDisplayName(notification.shopName) + 'の店舗出禁を許可しました')
+                        : '店舗出禁申請を拒否しました',
+                    'ok'
+                );
+                removeFromUi(notification.id);
+            } catch (e) {
+                toast(visibleError(e, (allow ? '許可' : '拒否') + 'に失敗しました'), 'error');
+            } finally {
+                respondingId = null;
+                renderList();
+            }
+        }
+
+        function discountPresetRequestIdFromNotification(notification) {
+            var id = String(notification && notification.id || '');
+            if (id.indexOf(DISCOUNT_PRESET_REQUEST_ID_PREFIX) !== 0) {
+                return '';
+            }
+            return id.slice(DISCOUNT_PRESET_REQUEST_ID_PREFIX.length).trim();
+        }
+
+        async function respondDiscountPresetRequest(notification, allow) {
+            if (!clientSdk || !notification || notification.shopId == null) {
+                return;
+            }
+            if (respondingId) {
+                return;
+            }
+            var requestId = discountPresetRequestIdFromNotification(notification);
+            if (!requestId) {
+                toast('クーポン申請 ID が不正です', 'error');
+                return;
+            }
+            var apiFn = allow ? clientSdk.approveDiscountPresetRequest : clientSdk.denyDiscountPresetRequest;
+            if (typeof apiFn !== 'function') {
+                toast('通知 API が利用できません', 'error');
+                return;
+            }
+            respondingId = notification.id;
+            renderList();
+            try {
+                await apiFn.call(clientSdk, notification.shopId, requestId);
+                persistDismissed(notification.id);
+                toast(
+                    allow
+                        ? (shopDisplayName(notification.shopName) + 'のクーポン適用を許可しました')
+                        : 'クーポン適用申請を拒否しました',
+                    'ok'
+                );
+                removeFromUi(notification.id);
+            } catch (e) {
+                toast(visibleError(e, (allow ? '許可' : '拒否') + 'に失敗しました'), 'error');
             } finally {
                 respondingId = null;
                 renderList();
@@ -395,14 +537,25 @@
 
         function startPolling() {
             stopPolling();
-            pollTimer = global.setInterval(function () {
-                if (global.document.visibilityState !== 'visible') {
-                    return;
+            function scheduleNext() {
+                if (pollTimer != null) {
+                    global.clearInterval(pollTimer);
+                    pollTimer = null;
                 }
-                void refresh();
-            }, POLL_MS);
+                var ms = (global.document.visibilityState === 'visible') ? POLL_MS : POLL_MS_HIDDEN;
+                pollTimer = global.setInterval(function () {
+                    if (global.document.visibilityState !== 'visible') {
+                        return;
+                    }
+                    void refresh();
+                }, ms);
+            }
+            scheduleNext();
             if (!visibilityListener) {
-                visibilityListener = onVisibilityChange;
+                visibilityListener = function () {
+                    onVisibilityChange();
+                    scheduleNext();
+                };
                 global.document.addEventListener('visibilitychange', visibilityListener);
             }
         }
@@ -462,6 +615,8 @@
     global.MasterOrderStaffNotificationsSdk = {
         version: SDK_VERSION,
         TYPE_SHOP_INVITE: TYPE_SHOP_INVITE,
+        TYPE_GUEST_BAN_REQUEST: TYPE_GUEST_BAN_REQUEST,
+        TYPE_DISCOUNT_PRESET_REQUEST: TYPE_DISCOUNT_PRESET_REQUEST,
         INTERACTION_READ_ONLY: INTERACTION_READ_ONLY,
         INTERACTION_APPROVE_DENY: INTERACTION_APPROVE_DENY,
         formatOccurredAt: formatOccurredAt,

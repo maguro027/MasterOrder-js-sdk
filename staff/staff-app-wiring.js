@@ -1,17 +1,19 @@
 /**
  * MasterOrder Staff App Wiring — index.html から注入する依存を SDK サービスへ束ねる。
  *
- * 依存: staff-ui / staff-claims / staff-session-mode / staff-qr / staff-firestore-runtime / staff-dashboard
+ * 依存: staff-ui / staff-claims / staff-session-mode / staff-qr / staff-firestore-runtime
+ * dashboard は遅延チャンク（staff-sdk.lazy-charts.js）— 初回は未ロード可
  * グローバル: MasterOrderStaffAppWiring
  */
 (function (global) {
     'use strict';
 
-    var SDK_VERSION = '1.0.0';
+    var SDK_VERSION = '1.1.0';
 
     /**
      * @param {{
      *   getShopId: function(): *,
+     *   getShopSlug?: function(): string,
      *   getCurrentShop: function(): object|null,
      *   getOrderPublicBase: function(): string,
      *   getApiBase: function(): string,
@@ -36,13 +38,15 @@
         var modeMod = global.MasterOrderStaffSessionModeSdk;
         var qrMod = global.MasterOrderStaffQrSdk;
         var runtimeMod = global.MasterOrderStaffFirestoreRuntimeSdk;
-        var dashMod = global.MasterOrderStaffDashboardSdk;
 
-        if (!ui || !claimsMod || !modeMod || !qrMod || !runtimeMod || !dashMod) {
-            throw new Error('Staff app wiring requires staff-ui, staff-claims, staff-session-mode, staff-qr, staff-firestore-runtime, staff-dashboard SDKs');
+        if (!ui || !claimsMod || !modeMod || !qrMod || !runtimeMod) {
+            throw new Error('Staff app wiring requires staff-ui, staff-claims, staff-session-mode, staff-qr, staff-firestore-runtime SDKs');
         }
 
         var firestoreBackoff = ui.createFirestoreBackoff();
+        var httpRateLimitBackoff = typeof ui.createHttpRateLimitBackoff === 'function'
+            ? ui.createHttpRateLimitBackoff()
+            : null;
 
         var sessionLoadCtl = ui.createSessionLoadStatusController({
             getSessionList: cfg.getSessionListEl,
@@ -64,6 +68,7 @@
             getAuthUser: cfg.getAuthUser,
             getApiBase: cfg.getApiBase,
             getShopId: cfg.getShopId,
+            getShopPublicId: cfg.getShopPublicId,
             firestoreDirectReadEnabled: cfg.firestoreDirectReadEnabled,
             claimsSyncTimeoutMs: cfg.claimsSyncTimeoutMs || 15000,
             promiseWithTimeout: ui.promiseWithTimeout
@@ -71,12 +76,14 @@
 
         var qr = qrMod.createStaffQrService({
             getShopId: cfg.getShopId,
+            getShopSlug: cfg.getShopSlug,
             getOrderPublicBase: cfg.getOrderPublicBase,
             isSessionsTabActive: hooks.isSessionsTabActive || function () { return false; }
         });
 
         var firestoreRuntime = runtimeMod.createFirestoreSessionsRuntime({
             getShopId: cfg.getShopId,
+            getShopPublicId: cfg.getShopPublicId,
             sessionCache: cfg.sessionCache,
             staffSdk: cfg.clientSdk,
             isDirectReadEnabled: function () {
@@ -97,7 +104,16 @@
             },
             markFirestoreBackoff: firestoreBackoff.mark,
             formatStaffApiError: function (err, fb) {
+                if (httpRateLimitBackoff) {
+                    httpRateLimitBackoff.mark(err);
+                }
                 return ui.formatStaffApiError(err, fb, firestoreBackoff);
+            },
+            staffUserVisibleLoadError: function (err, fb) {
+                if (httpRateLimitBackoff) {
+                    httpRateLimitBackoff.mark(err);
+                }
+                return ui.staffUserVisibleLoadError(err, fb, firestoreBackoff);
             },
             setSessionLoadStatus: sessionLoadCtl.setStatus,
             updateSessionLoadDetail: sessionLoadCtl.updateDetail,
@@ -120,12 +136,27 @@
             onRestSaveOfflineSnapshot: hooks.onRestSaveOfflineSnapshot,
             attachListenerAfterClaims: hooks.attachListenerAfterClaims,
             bootstrapSessionTotals: hooks.bootstrapSessionTotals,
-            onReconcileTableSeats: hooks.onReconcileTableSeats
+            onReconcileTableSeats: hooks.onReconcileTableSeats,
+            onSessionsChangedForOrders: hooks.onSessionsChangedForOrders,
+            onOrderSignalBump: hooks.onOrderSignalBump,
+            onOrderSignalHealth: hooks.onOrderSignalHealth,
+            onOrderSignalError: hooks.onOrderSignalError
         });
 
-        var dashboard = dashMod.createStaffDashboardCharts({
-            getChartJsReady: function () { return global.__chartJsReady; }
-        });
+        var dashboardInstance = null;
+
+        function getDashboard() {
+            var dashMod = global.MasterOrderStaffDashboardSdk;
+            if (!dashMod || typeof dashMod.createStaffDashboardCharts !== 'function') {
+                throw new Error('Staff dashboard SDK is not loaded yet (call MasterOrderStaffLazyLoader.ensureCharts first)');
+            }
+            if (!dashboardInstance) {
+                dashboardInstance = dashMod.createStaffDashboardCharts({
+                    getChartJsReady: function () { return global.__chartJsReady; }
+                });
+            }
+            return dashboardInstance;
+        }
 
         function getTableSeatsFromRuntime() {
             return firestoreRuntime.getTableSeatsCache();
@@ -145,15 +176,39 @@
             claims: claims,
             qr: qr,
             firestoreRuntime: firestoreRuntime,
-            dashboard: dashboard,
+            get dashboard() {
+                return getDashboard();
+            },
+            ensureDashboard: function () {
+                var loader = global.MasterOrderStaffLazyLoader;
+                var ready = Promise.resolve();
+                if (loader && typeof loader.ensureCharts === 'function') {
+                    ready = loader.ensureCharts();
+                }
+                return ready.then(function () {
+                    return getDashboard();
+                });
+            },
             ui: ui,
             getTableSeatsFromRuntime: getTableSeatsFromRuntime,
             syncTableSeatsCacheToRuntime: syncTableSeatsCacheToRuntime,
             formatStaffApiError: function (err, fallback) {
+                if (httpRateLimitBackoff) {
+                    httpRateLimitBackoff.mark(err);
+                }
                 return ui.formatStaffApiError(err, fallback, firestoreBackoff);
+            },
+            staffUserVisibleLoadError: function (err, fallback) {
+                if (httpRateLimitBackoff) {
+                    httpRateLimitBackoff.mark(err);
+                }
+                return ui.staffUserVisibleLoadError(err, fallback, firestoreBackoff);
             },
             isFirestoreBackoffActive: function () {
                 return firestoreBackoff.isActive();
+            },
+            isHttpRateLimitBackoffActive: function () {
+                return !!(httpRateLimitBackoff && httpRateLimitBackoff.isActive());
             },
             markFirestoreBackoff: function (err) {
                 firestoreBackoff.mark(err);

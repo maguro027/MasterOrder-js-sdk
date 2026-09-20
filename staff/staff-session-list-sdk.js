@@ -10,20 +10,21 @@
 (function (global) {
     'use strict';
 
-    var SDK_VERSION = '1.2.0';
+    var SDK_VERSION = '1.2.1';
 
     function asArray(value) {
         return Array.isArray(value) ? value : [];
     }
 
-    function mergeTableSeatsForDisplay(tableSeats, sessions) {
+    function mergeTableSeatsForDisplay(tableSeats, sessions, previousDisplay) {
         var firestoreSdk = global.MasterOrderStaffFirestoreSdk;
         if (!firestoreSdk || typeof firestoreSdk.mergeTableSeatsWithSessions !== 'function') {
             return asArray(tableSeats);
         }
         return firestoreSdk.mergeTableSeatsWithSessions(
             asArray(tableSeats),
-            asArray(sessions)
+            asArray(sessions),
+            asArray(previousDisplay)
         );
     }
 
@@ -63,32 +64,30 @@
     function refreshFirestoreMergedGrid(hooks, options) {
         var h = hooks || {};
         var opts = options || {};
-        var chain = Promise.resolve();
+        var tasks = [];
 
         if (opts.refreshTableMetadata === true && typeof h.refreshTableMetadata === 'function') {
-            chain = chain.then(function () {
-                return h.refreshTableMetadata({ includeSessionStatus: false });
-            }).then(function (tables) {
-                if (typeof h.setTableSeatsCache === 'function') {
-                    h.setTableSeatsCache(asArray(tables));
-                }
-                return tables;
-            });
+            tasks.push(
+                Promise.resolve(h.refreshTableMetadata({ includeSessionStatus: false })).then(function (tables) {
+                    if (typeof h.setTableSeatsCache === 'function') {
+                        h.setTableSeatsCache(asArray(tables));
+                    }
+                    return tables;
+                })
+            );
         }
         if (typeof h.refreshSessionTotals === 'function') {
-            chain = chain.then(function () {
-                return h.refreshSessionTotals({ force: true });
-            });
+            tasks.push(Promise.resolve(h.refreshSessionTotals({ force: true })));
         }
-        return chain.then(function () {
+        return Promise.all(tasks).then(function () {
             if (typeof h.renderMergedViews === 'function') {
                 h.renderMergedViews();
             }
         });
     }
 
-    function buildMergedGridView(tableSeats, sessions) {
-        return mergeTableSeatsForDisplay(tableSeats, sessions);
+    function buildMergedGridView(tableSeats, sessions, previousDisplay) {
+        return mergeTableSeatsForDisplay(tableSeats, sessions, previousDisplay);
     }
 
     /**

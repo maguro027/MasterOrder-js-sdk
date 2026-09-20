@@ -5,7 +5,6 @@
 | ファイル | グローバル | 説明 |
 |----------|------------|------|
 | `staff-sdk.js` | `MasterOrderStaffSdk` | 店舗 API クライアント（推奨エントリ） |
-| `client-sdk.js` | `MasterOrderClientSdk` | 互換シム（`staff-sdk.js` で十分） |
 | `staff-ui-sdk.js` | `MasterOrderStaffUiSdk` | UI 共通（エラー整形・日時） |
 | `staff-claims-sdk.js` | `MasterOrderStaffClaimsSdk` | Firebase claims 同期 |
 | `staff-session-mode-sdk.js` | `MasterOrderStaffSessionModeSdk` | 都度QR / 固定QR モード |
@@ -19,7 +18,7 @@
 | `staff-email-auth-sdk.js` | — | メール認証 |
 | `staff-user-sdk.js` | — | プロフィール・トップバー |
 | `staff-inventory-sdk.js` | — | 在庫入力 |
-| `staff-app-wiring.js` | `MasterOrderStaffAppWiring` | **最後に読み込む** — 依存束ね |
+| `staff-escpos-sdk.js` | `MasterOrderStaffEscPosSdk` | **生成物。** 実体は [`js-sdk/printer/`](../printer/README.md) の IIFE |
 
 **読み込み順:** Core の後、`staff-sdk.js` から。`staff-app-wiring.js` は Staff モジュールの末尾。
 

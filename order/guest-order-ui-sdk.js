@@ -255,6 +255,262 @@
         }
     }
 
+    function lineCancelState(item) {
+        if (!item) {
+            return { fullyCancelled: false, partiallyCancelled: false };
+        }
+        var cancelledQty = item.cancelledQuantity != null ? Number(item.cancelledQuantity) : 0;
+        var qty = item.quantity != null ? Number(item.quantity) : 0;
+        var fullyCancelled = item.fullyCancelled === true || (qty > 0 && cancelledQty >= qty);
+        return {
+            fullyCancelled: fullyCancelled,
+            partiallyCancelled: !fullyCancelled && cancelledQty > 0
+        };
+    }
+
+    function splitQtyChangeSuffix(text) {
+        var raw = String(text || '');
+        // 「5個→1個」/「5 → 1」などを本文と分離（打ち消し線を数量変更だけ外す）
+        var match = raw.match(/^(.*?)([\s\u3000]+)(\d+\s*個?\s*→\s*\d+\s*個?)\s*$/);
+        if (!match) {
+            return { body: raw, qtyChange: '' };
+        }
+        return { body: match[1], qtyChange: match[3] };
+    }
+
+    function appendHistoryLines(container, lines, items) {
+        var hasLineCancel = false;
+        lines.forEach(function (line, idx) {
+            var text = (line && typeof line === 'object' && line.text != null)
+                ? String(line.text)
+                : String(line || '');
+            var item = Array.isArray(items) ? (items[idx] || null) : null;
+            var cancel = lineCancelState(item);
+            var row = global.document.createElement('div');
+            row.className = 'order-history-line';
+            if (cancel.fullyCancelled) {
+                row.classList.add('is-cancelled');
+                hasLineCancel = true;
+                row.textContent = text;
+            } else if (cancel.partiallyCancelled) {
+                row.classList.add('is-partially-cancelled');
+                hasLineCancel = true;
+                var parts = splitQtyChangeSuffix(text);
+                var body = global.document.createElement('span');
+                body.className = 'order-history-line-body';
+                body.textContent = parts.body;
+                row.appendChild(body);
+                if (parts.qtyChange) {
+                    var qty = global.document.createElement('span');
+                    qty.className = 'order-history-line-qty-change';
+                    qty.textContent = parts.qtyChange;
+                    row.appendChild(qty);
+                }
+            } else {
+                row.textContent = text;
+            }
+            container.appendChild(row);
+        });
+        return hasLineCancel;
+    }
+
+    function ensureHistoryDetailModal(orderSdk, lang) {
+        var existing = global.document.getElementById('orderHistoryDetailModal');
+        if (existing) {
+            return existing;
+        }
+        var modal = global.document.createElement('div');
+        modal.id = 'orderHistoryDetailModal';
+        modal.className = 'modal order-history-detail-modal';
+        modal.setAttribute('role', 'dialog');
+        modal.setAttribute('aria-modal', 'true');
+        modal.setAttribute('aria-labelledby', 'orderHistoryDetailTitle');
+        modal.innerHTML =
+            '<div class="modal-card order-history-detail-card">'
+            + '<div class="modal-handle" aria-hidden="true"></div>'
+            + '<div class="modal-title" id="orderHistoryDetailTitle"></div>'
+            + '<div class="order-history-detail-meta" id="orderHistoryDetailMeta"></div>'
+            + '<div class="order-history-detail-lines" id="orderHistoryDetailLines"></div>'
+            + '<div class="order-history-detail-total" id="orderHistoryDetailTotal"></div>'
+            + '<div class="modal-foot">'
+            + '<button type="button" class="btn-primary" id="orderHistoryDetailCloseBtn"></button>'
+            + '</div>'
+            + '</div>';
+        global.document.body.appendChild(modal);
+
+        function closeModal() {
+            modal.classList.remove('show');
+        }
+        modal.addEventListener('click', function (ev) {
+            if (ev.target === modal) {
+                closeModal();
+            }
+        });
+        var closeBtn = modal.querySelector('#orderHistoryDetailCloseBtn');
+        if (closeBtn) {
+            closeBtn.addEventListener('click', closeModal);
+        }
+        return modal;
+    }
+
+    function openOrderHistoryDetail(order, options) {
+        var opts = options || {};
+        var orderSdk = opts.orderSdk;
+        var lang = resolveLang(orderSdk, opts.lang);
+        var menus = opts.menus || [];
+        var modal = ensureHistoryDetailModal(orderSdk, lang);
+        var titleEl = modal.querySelector('#orderHistoryDetailTitle');
+        var metaEl = modal.querySelector('#orderHistoryDetailMeta');
+        var linesEl = modal.querySelector('#orderHistoryDetailLines');
+        var totalEl = modal.querySelector('#orderHistoryDetailTotal');
+        var closeBtn = modal.querySelector('#orderHistoryDetailCloseBtn');
+
+        if (titleEl) {
+            titleEl.textContent = t(orderSdk, 'historyDetailTitle', null, lang);
+        }
+        if (closeBtn) {
+            closeBtn.textContent = t(orderSdk, 'historyDetailClose', null, lang);
+        }
+        if (metaEl) {
+            metaEl.replaceChildren();
+            var time = global.document.createElement('div');
+            time.className = 'order-history-detail-time';
+            time.textContent = String(order && order.timestamp || '').trim();
+            metaEl.appendChild(time);
+            var status = String(order && order.status || '').toUpperCase();
+            if (status === 'CANCELLED') {
+                var cancelled = global.document.createElement('div');
+                cancelled.className = 'order-history-card-cancelled';
+                cancelled.textContent = t(orderSdk, 'historyCancelled', null, lang);
+                metaEl.appendChild(cancelled);
+            }
+        }
+        if (linesEl) {
+            linesEl.replaceChildren();
+            var items = Array.isArray(order && order.items) ? order.items : [];
+            if (items.length) {
+                items.forEach(function (rawItem) {
+                    var item = rawItem;
+                    if (orderSdk && typeof orderSdk.normalizeOrderHistoryItem === 'function') {
+                        item = orderSdk.normalizeOrderHistoryItem(rawItem) || rawItem;
+                    }
+                    var name = resolveMenuName(
+                        orderSdk,
+                        item && item.menuId,
+                        menus,
+                        (item && item.menuName) || t(orderSdk, 'unknownMenu', null, lang),
+                        lang
+                    );
+                    var qty = item && item.quantity != null ? Number(item.quantity) : 0;
+                    var cancel = lineCancelState(item);
+                    var activeQty = item && item.activeQuantity != null
+                        ? Number(item.activeQuantity)
+                        : Math.max(0, qty - Number((item && item.cancelledQuantity) || 0));
+                    var row = global.document.createElement('div');
+                    row.className = 'order-history-detail-line';
+                    if (cancel.fullyCancelled) {
+                        row.classList.add('is-cancelled');
+                    } else if (cancel.partiallyCancelled) {
+                        row.classList.add('is-partially-cancelled');
+                    }
+                    var main = global.document.createElement('div');
+                    main.className = 'order-history-detail-line-main';
+                    var left = global.document.createElement('div');
+                    left.className = 'order-history-detail-line-name';
+                    if (cancel.fullyCancelled) {
+                        left.textContent = name + ' × ' + qty + '（' + t(orderSdk, 'historyCancelled', null, lang) + '）';
+                    } else if (cancel.partiallyCancelled) {
+                        var qtyChange = t(orderSdk, 'historyQtyChange', { from: qty, to: activeQty }, lang);
+                        left.textContent = name + ' × ' + activeQty + ' / ' + qty
+                            + '（' + t(orderSdk, 'historyPartialLine', null, lang) + '）';
+                        if (qtyChange) {
+                            var qtyEl = global.document.createElement('span');
+                            qtyEl.className = 'order-history-detail-qty-change';
+                            qtyEl.textContent = qtyChange;
+                            left.appendChild(qtyEl);
+                        }
+                    } else {
+                        left.textContent = name + ' × ' + qty;
+                    }
+                    var right = global.document.createElement('div');
+                    right.className = 'order-history-detail-line-price';
+                    var unit = Number(
+                        (item && (item.unitPrice != null ? item.unitPrice : item.priceAtOrder)) || 0
+                    ) + Number((item && item.toppingPrice) || 0);
+                    var lineTotal = item && item.subTotal != null
+                        ? Number(item.subTotal)
+                        : unit * Math.max(0, (item && item.activeQuantity != null)
+                            ? Number(item.activeQuantity)
+                            : qty - Number((item && item.cancelledQuantity) || 0));
+                    var amount = Number(lineTotal);
+                    if (!Number.isFinite(amount)) {
+                        amount = 0;
+                    }
+                    right.textContent = amount < 0
+                        ? '−¥' + Math.abs(amount).toLocaleString()
+                        : '¥' + amount.toLocaleString();
+                    main.appendChild(left);
+                    main.appendChild(right);
+                    row.appendChild(main);
+
+                    var toppings = item && Array.isArray(item.toppings) ? item.toppings : [];
+                    var topWrap = global.document.createElement('div');
+                    topWrap.className = 'order-history-detail-toppings';
+                    var topLabel = global.document.createElement('div');
+                    topLabel.className = 'order-history-detail-customs-label';
+                    topLabel.textContent = t(orderSdk, 'historyCustomLabel', null, lang);
+                    topWrap.appendChild(topLabel);
+                    if (toppings.length) {
+                        toppings.forEach(function (top) {
+                            var tip = global.document.createElement('div');
+                            tip.className = 'order-history-detail-topping';
+                            var tipName = top && top.name ? String(top.name) : '';
+                            if (!tipName && typeof top === 'string') {
+                                tipName = top;
+                            }
+                            var tipPrice = top && top.price != null ? Number(top.price) : 0;
+                            tip.textContent = tipPrice > 0
+                                ? ('+ ' + tipName + '（¥' + tipPrice.toLocaleString() + '）')
+                                : ('+ ' + tipName);
+                            topWrap.appendChild(tip);
+                        });
+                    } else {
+                        var none = global.document.createElement('div');
+                        none.className = 'order-history-detail-topping is-empty';
+                        none.textContent = t(orderSdk, 'historyNoCustom', null, lang);
+                        topWrap.appendChild(none);
+                    }
+                    row.appendChild(topWrap);
+                    linesEl.appendChild(row);
+                });
+            } else {
+                var lines = [];
+                if (orderSdk && typeof orderSdk.formatOrderHistoryLines === 'function') {
+                    lines = orderSdk.formatOrderHistoryLines(order, menus, { lang: lang });
+                } else if (order && Array.isArray(order.lines)) {
+                    lines = order.lines;
+                }
+                lines.forEach(function (line) {
+                    var row = global.document.createElement('div');
+                    row.className = 'order-history-detail-line';
+                    row.textContent = (line && typeof line === 'object' && line.text != null)
+                        ? String(line.text)
+                        : String(line || '');
+                    linesEl.appendChild(row);
+                });
+            }
+        }
+        if (totalEl) {
+            var displayTotal = order && order.total;
+            if (orderSdk && typeof orderSdk.resolveOrderHistoryDisplayTotal === 'function') {
+                displayTotal = orderSdk.resolveOrderHistoryDisplayTotal(order);
+            }
+            totalEl.textContent = t(orderSdk, 'historyDetailTotal', null, lang)
+                + ' ¥' + Number(displayTotal || 0).toLocaleString();
+        }
+        modal.classList.add('show');
+    }
+
     /**
      * @param {{
      *   orderHistory: Array,
@@ -289,8 +545,13 @@
             : 'sending';
         var frag = global.document.createDocumentFragment();
         history.slice().reverse().forEach(function (order) {
-            var card = global.document.createElement('div');
+            var card = global.document.createElement('button');
+            card.type = 'button';
             card.className = 'order-history-card';
+            var isCancelled = String(order && order.status || '').toUpperCase() === 'CANCELLED';
+            if (isCancelled) {
+                card.classList.add('is-cancelled');
+            }
 
             var body = global.document.createElement('div');
             body.className = 'order-history-card-body';
@@ -310,8 +571,22 @@
             if (lines.length) {
                 var detail = global.document.createElement('div');
                 detail.className = 'order-history-card-detail';
-                detail.textContent = lines.join(' / ');
+                var items = Array.isArray(order.items) ? order.items : [];
+                var hasLineCancel = appendHistoryLines(detail, lines, items);
                 left.appendChild(detail);
+                if (!isCancelled && hasLineCancel) {
+                    var partialMsg = global.document.createElement('div');
+                    partialMsg.className = 'order-history-card-cancelled';
+                    partialMsg.textContent = t(orderSdk, 'historyPartiallyCancelled', null, opts.lang)
+                        || '一部の商品がキャンセルされました';
+                    left.appendChild(partialMsg);
+                }
+            }
+            if (isCancelled) {
+                var cancelledMsg = global.document.createElement('div');
+                cancelledMsg.className = 'order-history-card-cancelled';
+                cancelledMsg.textContent = t(orderSdk, 'historyCancelled', null, opts.lang);
+                left.appendChild(cancelledMsg);
             }
 
             var right = global.document.createElement('div');
@@ -326,8 +601,9 @@
             body.appendChild(right);
             card.appendChild(body);
 
-            var isSending = order.sendStatus === sendingStatus;
+            var isSending = !isCancelled && order.sendStatus === sendingStatus;
             if (isSending) {
+                card.disabled = true;
                 var overlay = global.document.createElement('div');
                 overlay.className = 'order-history-sending-overlay';
                 overlay.setAttribute('aria-live', 'polite');
@@ -344,6 +620,14 @@
                 overlay.appendChild(spinner);
                 overlay.appendChild(label);
                 card.appendChild(overlay);
+            } else {
+                card.addEventListener('click', function () {
+                    openOrderHistoryDetail(order, {
+                        orderSdk: orderSdk,
+                        menus: opts.menus || [],
+                        lang: lang
+                    });
+                });
             }
 
             frag.appendChild(card);
@@ -392,6 +676,89 @@
     /**
      * @param {{
      *   orderSdk: object,
+     *   elements: { guestAllergyPicker: Element },
+     *   onAllergiesChanged?: function(Array<string>): void|Promise<void>
+     * }} options
+     */
+    function renderAllergyPicker(options) {
+        var opts = options || {};
+        var picker = opts.elements && opts.elements.guestAllergyPicker;
+        var orderSdk = opts.orderSdk;
+        if (!picker || !orderSdk || typeof orderSdk.getGuestHiddenAllergies !== 'function') {
+            return;
+        }
+        var lang = opts.lang
+            || (typeof orderSdk.getGuestMenuLang === 'function' ? orderSdk.getGuestMenuLang() : 'ja');
+        var optionsList;
+        if (typeof orderSdk.guestAllergyOptions === 'function') {
+            optionsList = orderSdk.guestAllergyOptions(lang);
+        } else if (Array.isArray(orderSdk.GUEST_ALLERGY_OPTIONS)) {
+            optionsList = orderSdk.GUEST_ALLERGY_OPTIONS;
+        } else {
+            optionsList = [];
+        }
+        var selected = typeof orderSdk.getGuestHiddenAllergies === 'function'
+            ? orderSdk.getGuestHiddenAllergies()
+            : [];
+        var selectedSet = {};
+        selected.forEach(function (code) {
+            selectedSet[code] = true;
+        });
+        picker.replaceChildren();
+        var catalog = global.MasterOrderAllergens;
+        optionsList.forEach(function (pair) {
+            var code = pair[0];
+            var label = pair[1];
+            var emoji = '';
+            if (catalog && catalog.BY_CODE && catalog.BY_CODE[code]) {
+                emoji = catalog.BY_CODE[code].emoji || '';
+            }
+            var row = global.document.createElement('label');
+            row.className = 'guest-allergy-option' + (selectedSet[code] ? ' is-selected' : '');
+            var input = global.document.createElement('input');
+            input.type = 'checkbox';
+            input.value = code;
+            input.checked = !!selectedSet[code];
+            input.addEventListener('change', function () {
+                var next = [];
+                picker.querySelectorAll('input[type="checkbox"]').forEach(function (cb) {
+                    if (cb.checked) {
+                        next.push(cb.value);
+                    }
+                });
+                if (typeof orderSdk.setGuestHiddenAllergies === 'function') {
+                    orderSdk.setGuestHiddenAllergies(next);
+                }
+                row.classList.toggle('is-selected', !!input.checked);
+                if (typeof opts.onAllergiesChanged === 'function') {
+                    void opts.onAllergiesChanged(next);
+                }
+            });
+            var emojiEl = global.document.createElement('span');
+            emojiEl.className = 'guest-allergy-emoji';
+            emojiEl.setAttribute('aria-hidden', 'true');
+            emojiEl.textContent = emoji;
+            var text = global.document.createElement('span');
+            text.className = 'guest-allergy-label';
+            text.textContent = typeof orderSdk.guestAllergyLabel === 'function'
+                ? (function () {
+                    var full = orderSdk.guestAllergyLabel(code, lang);
+                    if (emoji && full.indexOf(emoji) === 0) {
+                        return full.slice(emoji.length).trim();
+                    }
+                    return full || label;
+                })()
+                : label;
+            row.appendChild(input);
+            row.appendChild(emojiEl);
+            row.appendChild(text);
+            picker.appendChild(row);
+        });
+    }
+
+    /**
+     * @param {{
+     *   orderSdk: object,
      *   root?: Document|Element,
      *   elements?: object,
      *   manualSectionHidden?: boolean,
@@ -428,8 +795,14 @@
             renderOrderHistory: function (renderOpts) {
                 renderOrderHistory(Object.assign({ orderSdk: orderSdk }, renderOpts || {}));
             },
+            openOrderHistoryDetail: function (order, openOpts) {
+                openOrderHistoryDetail(order, Object.assign({ orderSdk: orderSdk }, openOpts || {}));
+            },
             renderLanguagePicker: function (renderOpts) {
                 renderLanguagePicker(Object.assign({ orderSdk: orderSdk }, renderOpts || {}));
+            },
+            renderAllergyPicker: function (renderOpts) {
+                renderAllergyPicker(Object.assign({ orderSdk: orderSdk }, renderOpts || {}));
             },
             formatCartAddedMessage: function (menuName, lang) {
                 return t(orderSdk, 'cartAdded', { name: menuName || t(orderSdk, 'unnamed', null, lang) }, lang);
@@ -445,7 +818,9 @@
         applyLanguage: applyLanguage,
         renderCart: renderCart,
         renderOrderHistory: renderOrderHistory,
+        openOrderHistoryDetail: openOrderHistoryDetail,
         renderLanguagePicker: renderLanguagePicker,
+        renderAllergyPicker: renderAllergyPicker,
         createGuestOrderPageUi: createGuestOrderPageUi
     };
 })(typeof window !== 'undefined' ? window : globalThis);

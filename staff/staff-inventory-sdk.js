@@ -8,7 +8,7 @@
     'use strict';
 
     var COOLDOWN_MS = 60 * 1000;
-    var LIST_RESET_COOLDOWN_MS = 5 * 60 * 1000;
+    var LIST_RESET_COOLDOWN_MS = 30 * 60 * 1000;
     var STORAGE_PREFIX = 'masterorder.staffInventoryCooldown.';
     var LIST_RESET_STORAGE_PREFIX = 'masterorder.staffInventoryListResetCooldown.';
 
@@ -306,21 +306,31 @@
             return Promise.resolve(opts.applyUpdate(menuId, payload))
                 .then(function (result) {
                     markCooldown(menuId);
-                    draft.menu.initialQuantity = draft.initialQuantity;
-                    draft.menu.stockQuantity = draft.stockQuantity;
+                    // 保存直後はペイロードを正とする。サーバーが別 TX で古い initialQuantity を返すレースを吸収する。
+                    draft.menu.initialQuantity = clampStock(payload.initialQuantity);
+                    draft.initialQuantity = draft.menu.initialQuantity;
+                    draft.menu.stockQuantity = clampStock(payload.stockQuantity);
+                    draft.stockQuantity = draft.menu.stockQuantity;
                     if (result && result.stockQuantity != null) {
                         draft.menu.stockQuantity = clampStock(result.stockQuantity);
                         draft.stockQuantity = draft.menu.stockQuantity;
                     }
                     if (result && result.initialQuantity != null) {
-                        draft.menu.initialQuantity = clampStock(result.initialQuantity);
-                        draft.initialQuantity = draft.menu.initialQuantity;
+                        var serverInitial = clampStock(result.initialQuantity);
+                        if (serverInitial === draft.initialQuantity) {
+                            draft.menu.initialQuantity = serverInitial;
+                            draft.initialQuantity = serverInitial;
+                        }
                     }
-                    if (typeof result.soldOut === 'boolean') {
+                    if (result && typeof result.soldOut === 'boolean') {
                         draft.menu.soldOut = result.soldOut;
+                    } else {
+                        draft.menu.soldOut = draft.stockQuantity <= 0;
                     }
-                    if (result.stockStatusLabel) {
+                    if (result && result.stockStatusLabel) {
                         draft.menu.stockStatusLabel = result.stockStatusLabel;
+                    } else {
+                        draft.menu.stockStatusLabel = draft.menu.soldOut ? '在庫切れ' : '在庫あり';
                     }
                     if (typeof opts.onApplied === 'function') {
                         opts.onApplied(result, draft.menu);
@@ -347,11 +357,39 @@
             el.addEventListener('click', handler);
         }
 
+        function bindQuantityInput(el, field) {
+            if (!el) {
+                return;
+            }
+            el.addEventListener('input', function () {
+                if (!draft.menu || draft.menu.isDraft || draft.applying) {
+                    return;
+                }
+                var next = clampStock(el.value);
+                if (field === 'initial') {
+                    draft.initialQuantity = next;
+                } else {
+                    draft.stockQuantity = next;
+                }
+                refreshUi();
+            });
+            el.addEventListener('change', function () {
+                if (!draft.menu || draft.menu.isDraft || draft.applying) {
+                    return;
+                }
+                var quantity = field === 'initial' ? draft.initialQuantity : draft.stockQuantity;
+                setQuantityDisplay(el, quantity);
+                refreshUi();
+            });
+        }
+
         bindClick(els.initialDec, function () { bumpInitial(-1); });
         bindClick(els.initialInc, function () { bumpInitial(1); });
         bindClick(els.stockDec, function () { bumpStock(-1); });
         bindClick(els.stockInc, function () { bumpStock(1); });
         bindClick(els.applyBtn, function () { void applyUpdate(); });
+        bindQuantityInput(els.initialValue, 'initial');
+        bindQuantityInput(els.stockValue, 'stock');
 
         return {
             COOLDOWN_MS: COOLDOWN_MS,

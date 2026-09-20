@@ -19,7 +19,17 @@
     }
 
     function needsEmailVerification(user) {
-        return !!(user && usesPasswordProvider(user) && user.emailVerified !== true);
+        if (!user) {
+            return false;
+        }
+        // Google 等の外部 IdP はプロバイダ側で確認済み。メール/パスワードのみ Firebase 確認を要求する。
+        if (!usesPasswordProvider(user)) {
+            return false;
+        }
+        if (!user.email) {
+            return true;
+        }
+        return user.emailVerified !== true;
     }
 
     function parseOobCode(raw) {
@@ -58,6 +68,9 @@
         if (code === 'auth/invalid-action-code' || code === 'auth/expired-action-code') {
             return '確認コードが無効または期限切れです。確認メールを再送してください。';
         }
+        if (code === 'auth/missing-email') {
+            return 'メールアドレスを入力してください。';
+        }
         return msg;
     }
 
@@ -77,6 +90,24 @@
      */
     function signInWithEmail(auth, email, password) {
         return auth.signInWithEmailAndPassword(String(email || '').trim(), String(password || ''));
+    }
+
+    /**
+     * @param {object} auth firebase.auth()
+     * @param {string} email
+     * @param {object} [actionCodeSettings]
+     */
+    function sendPasswordResetEmail(auth, email, actionCodeSettings) {
+        var trimmed = String(email || '').trim();
+        if (!trimmed) {
+            return Promise.reject(Object.assign(new Error('メールアドレスを入力してください。'), {
+                code: 'auth/missing-email'
+            }));
+        }
+        if (actionCodeSettings) {
+            return auth.sendPasswordResetEmail(trimmed, actionCodeSettings);
+        }
+        return auth.sendPasswordResetEmail(trimmed);
     }
 
     /**
@@ -130,6 +161,7 @@
         formatAuthError: formatAuthError,
         signUpWithEmail: signUpWithEmail,
         signInWithEmail: signInWithEmail,
+        sendPasswordResetEmail: sendPasswordResetEmail,
         sendVerificationEmail: sendVerificationEmail,
         applyVerificationCode: applyVerificationCode,
         refreshEmailVerified: refreshEmailVerified

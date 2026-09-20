@@ -2,14 +2,16 @@
  * MasterOrder Staff Claims SDK — Firebase Custom Claims 同期・検証（access 形式）。
  *
  * Claims 形式:
- *   { a:true } または { access:[{s,r,c?,d?}], shops:["1",...] }
+ *   { a:true } または { access:[{s,r,c?,d?}], shops:["uuid",...] }
+ *   access.s = 内部 shops.id / shops = Firestore Rules 用 publicId
  *
  * グローバル: MasterOrderStaffClaimsSdk
  */
 (function (global) {
     'use strict';
 
-    var SDK_VERSION = '2.0.0';
+    var SDK_VERSION = '2.1.0';
+    var UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
     function claimTruthy(value) {
         return value === true || value === 'true';
@@ -19,13 +21,14 @@
         if (!claims) {
             return [];
         }
-        if (Array.isArray(claims.shops)) {
-            return claims.shops.map(String);
-        }
-        if (Array.isArray(claims.access)) {
+        // Staff UI の店舗照合は access.s（内部 int）。shops は Firestore Rules 用 UUID。
+        if (Array.isArray(claims.access) && claims.access.length) {
             return claims.access.map(function (entry) {
                 return entry && entry.s != null ? String(entry.s) : '';
             }).filter(function (id) { return id !== ''; });
+        }
+        if (Array.isArray(claims.shops)) {
+            return claims.shops.map(String);
         }
         return [];
     }
@@ -55,7 +58,7 @@
             return false;
         }
         if (activeShopId == null || activeShopId === '') {
-            return body.staff === true || body.admin === true || (Array.isArray(body.access) && body.access.length > 0);
+            return false;
         }
         var ids = [];
         if (Array.isArray(body.shopIds)) {
@@ -78,9 +81,42 @@
             return false;
         }
         if (activeShopId == null || activeShopId === '') {
-            return true;
+            return false;
         }
         return accessShopIdsFromClaims(claims).indexOf(String(activeShopId)) >= 0;
+    }
+
+    /** Firestore Rules 用 shops claim（UUID）。int の旧値は無視する。 */
+    function firestoreShopKeysFromClaims(claims) {
+        if (!claims || !Array.isArray(claims.shops)) {
+            return [];
+        }
+        return claims.shops.map(function (id) {
+            return id != null ? String(id).trim().toLowerCase() : '';
+        }).filter(function (id) {
+            return UUID_RE.test(id);
+        });
+    }
+
+    /**
+     * Firestore 直読前のゲート: access.s に加え Rules 用 shops に publicId が入っていること。
+     * access.s だけ見ると旧 token（shops:["1"]）でも成功扱い→ permission-denied になる。
+     */
+    function staffFirestoreClaimsReady(claims, shopId, shopPublicId) {
+        if (!claims) {
+            return false;
+        }
+        if (isPlatformAdminClaims(claims)) {
+            return true;
+        }
+        if (!staffClaimsAllowShop(claims, shopId)) {
+            return false;
+        }
+        var publicId = shopPublicId != null ? String(shopPublicId).trim().toLowerCase() : '';
+        if (!publicId || !UUID_RE.test(publicId)) {
+            return false;
+        }
+        return firestoreShopKeysFromClaims(claims).indexOf(publicId) >= 0;
     }
 
     function findAccessEntry(claims, shopId) {
@@ -122,9 +158,20 @@
         var getAuthUser = opts.getAuthUser;
         var getApiBase = opts.getApiBase;
         var getShopId = opts.getShopId;
+        var getShopPublicId = opts.getShopPublicId;
         var firestoreDirectReadEnabled = !!opts.firestoreDirectReadEnabled;
         var claimsSyncTimeoutMs = opts.claimsSyncTimeoutMs > 0 ? opts.claimsSyncTimeoutMs : 15000;
         var claimsSyncPromise = null;
+
+        function resolveShopPublicId() {
+            if (typeof getShopPublicId === 'function') {
+                var fromOpt = getShopPublicId();
+                if (fromOpt != null && String(fromOpt).trim()) {
+                    return String(fromOpt).trim().toLowerCase();
+                }
+            }
+            return null;
+        }
 
         function readClaims(forceRefresh) {
             var user = typeof getAuthUser === 'function' ? getAuthUser() : null;
@@ -141,21 +188,37 @@
             if (!user) {
                 return Promise.resolve(null);
             }
-            var attempts = Math.min(maxAttempts || 3, 3);
+            // setCustomClaims 反映待ち: access.s だけでは旧 token を成功扱いしてしまう
+            var attempts = Math.min(maxAttempts || 8, 12);
+            var shopPublicId = resolveShopPublicId();
 
             function tryAttempt(attempt) {
                 return readClaims(true).then(function (claims) {
-                    if (!shopIdForVerify || staffClaimsAllowShop(claims, shopIdForVerify)) {
+                    var ready = !shopIdForVerify
+                        ? hasStaffClaims(claims)
+                        : staffFirestoreClaimsReady(claims, shopIdForVerify, shopPublicId);
+                    if (ready) {
                         return user.getIdToken(true).then(function () {
                             return claims;
                         });
                     }
                     if (attempt + 1 < attempts) {
                         return new Promise(function (resolve) {
-                            global.setTimeout(resolve, 400);
+                            global.setTimeout(resolve, 500);
                         }).then(function () {
                             return tryAttempt(attempt + 1);
                         });
+                    }
+                    if (global.console && typeof global.console.warn === 'function') {
+                        global.console.warn(
+                            '[StaffClaims] token shops UUID not ready after sync',
+                            {
+                                shopId: shopIdForVerify,
+                                shopPublicId: shopPublicId,
+                                shops: claims && claims.shops,
+                                access: claims && claims.access
+                            }
+                        );
                     }
                     return readClaims(true);
                 });
@@ -174,7 +237,11 @@
             }
             return user.getIdToken(true).then(function (token) {
                 var apiBase = typeof getApiBase === 'function' ? getApiBase() : '';
-                var url = String(apiBase || '').replace(/\/$/, '') + '/auth/firebase/claims/sync';
+                var routes = global.MasterOrderApiRoutes;
+                var claimsPath = routes && routes.paths && routes.paths.staff
+                    ? routes.paths.staff.syncFirebaseClaims()
+                    : '/auth/firebase/claims/sync';
+                var url = String(apiBase || '').replace(/\/$/, '') + claimsPath;
                 return fetch(url, {
                     method: 'POST',
                     headers: { Authorization: 'Bearer ' + token }
@@ -238,20 +305,27 @@
                     return { ok: false, reason: 'server_denied', body: body };
                 }
                 if (lightweight || !shopIdForVerify) {
+                    // refresh は1回だけ。直後の readClaims は force しない（三重 getIdToken を避ける）
                     return refreshAuthToken().then(function () {
-                        return readClaims(true).then(function (claims) {
+                        return readClaims(false).then(function (claims) {
                             return { ok: true, claims: claims, body: body };
                         });
                     });
                 }
                 if (serverClaimsAllowShop(body, shopIdForVerify)) {
-                    return waitForTokenClaims(shopIdForVerify, 3).then(function (claims) {
-                        if (claims && staffClaimsAllowShop(claims, shopIdForVerify)) {
+                    return waitForTokenClaims(shopIdForVerify, 8).then(function (claims) {
+                        var publicId = resolveShopPublicId();
+                        if (claims && staffFirestoreClaimsReady(claims, shopIdForVerify, publicId)) {
                             return { ok: true, claims: claims, body: body };
                         }
-                        return refreshAuthToken().then(function () {
-                            return { ok: true, claims: claims || {}, body: body, tokenPending: true };
-                        });
+                        // access は揃っても shops UUID が無い = Firestore Rules で必ず deny
+                        return {
+                            ok: false,
+                            reason: 'firestore_shops_pending',
+                            claims: claims || {},
+                            body: body,
+                            shopPublicId: publicId
+                        };
                     });
                 }
                 return { ok: false, reason: 'claims_not_ready', body: body };
@@ -276,10 +350,14 @@
                 return 'Firebase 権限の同期 API に失敗しました。再ログインするか、ネットワークを確認してください。';
             }
             if (syncResult && syncResult.reason === 'disabled') {
-                return 'Firestore 直読が無効です（client-config を確認してください）。';
+                return 'Firestore 直読が無効です。管理者に連絡してください。';
             }
             if (syncResult && syncResult.reason === 'not_staff') {
                 return 'この Google アカウントには店舗スタッフ権限がありません。管理者にメンバー招待を依頼してください。';
+            }
+            if (syncResult && syncResult.reason === 'firestore_shops_pending') {
+                return 'Firestore 権限 (shops UUID) が ID トークンにまだ反映されていません。'
+                    + ' 数秒待って再読み込みするか、ログアウト→再ログインしてください。';
             }
             if (syncResult && syncResult.reason === 'server_denied') {
                 var ids = '(なし)';
@@ -320,6 +398,8 @@
         createStaffClaimsSync: createStaffClaimsSync,
         claimTruthy: claimTruthy,
         accessShopIdsFromClaims: accessShopIdsFromClaims,
+        firestoreShopKeysFromClaims: firestoreShopKeysFromClaims,
+        staffFirestoreClaimsReady: staffFirestoreClaimsReady,
         isPlatformAdminClaims: isPlatformAdminClaims,
         hasStaffClaims: hasStaffClaims,
         serverClaimsAllowShop: serverClaimsAllowShop,

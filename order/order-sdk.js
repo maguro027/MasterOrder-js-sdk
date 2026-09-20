@@ -1027,6 +1027,27 @@
         return inferGuestApiBase();
     }
 
+    function resolveDirectGateBase() {
+        if (typeof global._gatePublicBase === 'string' && global._gatePublicBase.trim()) {
+            return global._gatePublicBase.trim().replace(/\/$/, '');
+        }
+        return '';
+    }
+
+    function shouldRetryCatalogOnGateDirect(err) {
+        if (!err) {
+            return false;
+        }
+        var code = err.payload && err.payload.code;
+        if (code === 'UNEXPECTED_HTML' || code === 'CF_CHALLENGE') {
+            return true;
+        }
+        if (err.status === 502 || err.status === 503 || err.status === 0) {
+            return true;
+        }
+        return false;
+    }
+
     function usesGateCatalogRead() {
         return typeof global._gatePublicBase === 'string' && global._gatePublicBase.trim().length > 0;
     }
@@ -1053,7 +1074,7 @@
     }
 
     var GUEST_PUBLIC_SHOP_CACHE_PREFIX = 'mo_guest_public_shop:';
-    var GUEST_ORDER_BUNDLE_CACHE_PREFIX = 'mo_guest_order_bundle:v3:';
+    var GUEST_ORDER_BUNDLE_CACHE_PREFIX = 'mo_guest_order_bundle:v4:';
     var GUEST_ORDER_BUNDLE_CACHE_PREFIX_LEGACY = 'mo_guest_order_bundle:';
     /** generation 不一致で破棄するので長 TTL 可。CDN 365日方針に合わせる。 */
     var GUEST_ORDER_BUNDLE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
@@ -5153,7 +5174,8 @@
                         return stripGuestInventoryForBrowse(bundle);
                     }
 
-                    function fetchFullOrderBundle(invHint) {
+                    function fetchFullOrderBundle(invHint, httpClient) {
+                        var client = httpClient || readHttp;
                         var bundleQuery = guestCatalogInventoryQuery({
                             name: name || '',
                             lang: lang
@@ -5181,7 +5203,7 @@
                             acceptNotModified: true,
                             includeResponseMeta: true
                         }, includeInventory);
-                        return readHttp.get(
+                        return client.get(
                             core.withQuery(bundlePath, bundleQuery),
                             getOpts
                         ).then(function (result) {
@@ -5320,6 +5342,16 @@
                         network = probeThenMaybeFetchBundle(cachedPayload);
                     }
                     network = network.catch(function (err) {
+                        var directBase = resolveDirectGateBase();
+                        var catalogBase = inferGuestCatalogReadBase();
+                        if (directBase && catalogBase && directBase !== catalogBase
+                            && shouldRetryCatalogOnGateDirect(err)) {
+                            var directHttp = core.createHttpClient({ baseUrl: directBase });
+                            return fetchFullOrderBundle(
+                                includeInventory ? undefined : 'catalog',
+                                directHttp
+                            );
+                        }
                         var fallback = null;
                         if (cachedPayload && guestBundleLoadErrorAllowsCacheFallback(err)) {
                             try {

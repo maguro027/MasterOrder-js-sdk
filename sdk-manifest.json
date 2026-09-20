@@ -7,10 +7,12 @@
       "files": [
         "api-routes.js",
         "core-sdk.js",
+        "allergens.js",
         "consumption-tax.js",
         "menu-image-url.js",
         "menu-customer-text.js",
-        "text-input-ui.js"
+        "text-input-ui.js",
+        "plan-gate.js"
       ]
     },
     "order": {
@@ -18,28 +20,47 @@
       "description": "Guest order session, menu, cart, QR",
       "files": [
         "order-sdk.js",
+        "guest-menu-pricing.js",
         "guest-ui-i18n.js",
         "guest-order-ui-sdk.js",
-        "guest-firestore-sdk.js"
+        "guest-firestore-sdk.js",
+        "guest-qr-scanner-sdk.js"
+      ]
+    },
+    "printer": {
+      "label": "Printer",
+      "description": "Printer IIFEs: codec / receipt / modes / keep-open transport / Staff facade",
+      "files": [
+        "printer-codec.js",
+        "printer-receipt.js",
+        "printer-modes.js",
+        "printer-transport.js",
+        "printer-sdk.js"
       ]
     },
     "staff": {
       "label": "Staff",
       "description": "Staff dashboard, sessions, kitchen, Firestore helpers",
       "files": [
+        "staff-menu-mutation.js",
+        "staff-shop-context-sdk.js",
         "staff-sdk.js",
-        "client-sdk.js",
         "staff-inventory-sdk.js",
         "staff-ui-sdk.js",
         "staff-claims-sdk.js",
+        "staff-gate-assertion-sdk.js",
         "staff-session-mode-sdk.js",
         "staff-qr-sdk.js",
+        "staff-escpos-sdk.js",
+        "staff-lazy-loader-sdk.js",
         "staff-firestore-sdk.js",
         "staff-firestore-runtime-sdk.js",
         "staff-session-list-sdk.js",
         "staff-kitei-table-sdk.js",
         "staff-dashboard-sdk.js",
+        "staff-product-analysis-sdk.js",
         "staff-notifications-sdk.js",
+        "staff-pii-local-cache.js",
         "staff-email-auth-sdk.js",
         "staff-user-sdk.js",
         "staff-app-wiring.js"

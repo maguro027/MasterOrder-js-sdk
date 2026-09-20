@@ -2,14 +2,14 @@
  * MasterOrder Staff SDK — 店舗スタッフ向け（Firebase Auth + Server REST/SSE）。
  *
  * 依存: api-routes.js → core-sdk.js → staff-sdk.js
- * グローバル: MasterOrderStaffSdk（推奨） / MasterOrderClientSdk（後方互換エイリアス）
+ * グローバル: MasterOrderStaffSdk
  *
  * UI から Server へ直接 fetch せず、createStaffSdk() 経由で通信してください。
  */
 (function (global) {
     'use strict';
 
-    var SDK_VERSION = '1.2.2';
+    var SDK_VERSION = '1.2.7';
 
     var STAFF_SESSION_UPDATED_EVENT = 'masterorder:staff-session-updated';
 
@@ -35,7 +35,45 @@
         throw new Error('MasterOrderApiRoutes is required. Load api-routes.js before staff-sdk.js');
     }
     var staffPaths = apiRouteRegistry.paths.staff;
+
+    function planGate() {
+        return global.MasterOrderPlanGate || null;
+    }
+
+    function shopIsFree(subscribe) {
+        var gate = planGate();
+        if (gate && typeof gate.resolveIsFree === 'function') {
+            return gate.resolveIsFree(subscribe);
+        }
+        return !!(subscribe && (subscribe.isFree === true || subscribe.rank === 'FREE'));
+    }
+
+    function shopContextStore(options) {
+        if (options && options.shopContextStore) {
+            return options.shopContextStore;
+        }
+        var mod = global.MasterOrderStaffShopContextSdk;
+        return mod && mod.shared ? mod.shared : null;
+    }
+
+    function inventoryFreePlanError() {
+        var err = new Error('在庫管理は有料プラン（スモール以上）で利用できます');
+        err.status = 403;
+        err.payload = { isFree: true };
+        err.skipped = true;
+        return err;
+    }
+
+    function mergeMenusWithInventory(menus, inventory) {
+        var ui = global.MasterOrderStaffUiSdk;
+        if (ui && typeof ui.mergeMenusWithInventory === 'function') {
+            return ui.mergeMenusWithInventory(menus, inventory);
+        }
+        return menus;
+    }
+
     var authPaths = apiRouteRegistry.paths.auth || staffPaths;
+    var menuMutation = global.MasterOrderStaffMenuMutation;
 
     function issueSseTicket(http, shopId) {
         return http.post(core.withQuery(staffPaths.orderEventsTicket(), { shopId: shopId }), undefined)
@@ -72,9 +110,76 @@
         var profileApi = core.createProfileApi(http, authPaths);
         var accountStateApi = core.createAccountStateApi(http, authPaths);
         var piiCache = global.MasterOrderStaffPiiLocalCache;
+        var shopContext = shopContextStore(options);
+
+        function withInventoryGuard(shopId, run) {
+            if (!shopId) {
+                return run();
+            }
+            var subscribePromise = shopContext
+                ? shopContext.getSubscribe(http, staffPaths.shopSubscribe, shopId, { allowNullOnError: true })
+                : http.get(staffPaths.shopSubscribe(shopId)).catch(function () { return null; });
+            return subscribePromise.then(function (sub) {
+                if (shopIsFree(sub)) {
+                    throw inventoryFreePlanError();
+                }
+                return run();
+            });
+        }
+
+        function loadManageMenusBundle(shopId) {
+            if (shopContext) {
+                return shopContext.loadManageMenus(http, {
+                    manageMenus: staffPaths.manageMenus,
+                    shopSubscribe: staffPaths.shopSubscribe,
+                    shopInventory: staffPaths.shopInventory
+                }, shopId, {
+                    shopIsFree: shopIsFree,
+                    mergeMenusWithInventory: mergeMenusWithInventory
+                });
+            }
+            return Promise.all([
+                http.get(staffPaths.manageMenus(shopId)),
+                http.get(staffPaths.shopSubscribe(shopId)).catch(function () { return null; })
+            ]).then(function (pair) {
+                var menus = Array.isArray(pair[0]) ? pair[0] : [];
+                var subscribe = pair[1];
+                if (shopIsFree(subscribe)) {
+                    return { menus: menus, subscribe: subscribe };
+                }
+                return http.get(staffPaths.shopInventory(shopId)).catch(function () { return []; })
+                    .then(function (inventory) {
+                        return {
+                            menus: mergeMenusWithInventory(menus, inventory),
+                            subscribe: subscribe
+                        };
+                    });
+            });
+        }
+
         var getFirebaseUid = typeof options.getFirebaseUid === 'function'
             ? options.getFirebaseUid
             : function () { return options.firebaseUid || null; };
+
+        function isAuthorizationFailure(err) {
+            return !!err && (err.status === 401 || err.status === 403);
+        }
+
+        function isTransientNetworkFailure(err) {
+            if (!err || err.status !== 0) {
+                return false;
+            }
+            if (core.isRateLimitFailure && core.isRateLimitFailure(err)) {
+                return false;
+            }
+            return true;
+        }
+
+        function clearCachedIdentity(uid) {
+            if (uid && piiCache) {
+                piiCache.clearAll(uid);
+            }
+        }
 
         function cacheProfile(profile) {
             var uid = getFirebaseUid();
@@ -84,19 +189,115 @@
             return profile;
         }
 
-        function getMyProfileWithCache() {
+        var inflightProfilePromise = null;
+        var inflightProfileUid = null;
+        var myShopsInflight = Object.create(null);
+        var myShopsCache = Object.create(null);
+        var MY_SHOPS_TTL_MS = 2500;
+
+        function myShopsCacheKey(query) {
+            if (!query || typeof query !== 'object') {
+                return 'default';
+            }
+            var detail = query.detail != null ? String(query.detail) : '';
+            return detail ? ('detail:' + detail) : 'default';
+        }
+
+        function invalidateMyShopsCache() {
+            myShopsInflight = Object.create(null);
+            myShopsCache = Object.create(null);
+        }
+
+        function getMyShopsCached(query) {
+            var key = myShopsCacheKey(query);
+            var cached = myShopsCache[key];
+            if (cached && (Date.now() - cached.at) < MY_SHOPS_TTL_MS) {
+                return Promise.resolve(cached.value);
+            }
+            if (myShopsInflight[key]) {
+                return myShopsInflight[key];
+            }
+            var path = staffPaths.myShops();
+            var req = (query && typeof query === 'object')
+                ? http.get(core.withQuery(path, query))
+                : http.get(path);
+            var p = req.then(function (value) {
+                myShopsCache[key] = { at: Date.now(), value: value };
+                delete myShopsInflight[key];
+                return value;
+            }, function (err) {
+                delete myShopsInflight[key];
+                throw err;
+            });
+            myShopsInflight[key] = p;
+            return p;
+        }
+
+        function getMyProfileWithCache(callOptions) {
+            var opts = callOptions || {};
             var uid = getFirebaseUid();
-            return profileApi.getMyProfile()
-                .then(cacheProfile)
-                .catch(function (err) {
-                    if (uid && piiCache) {
-                        var cached = piiCache.loadProfile(uid);
-                        if (cached) {
-                            return cached;
-                        }
+            if (inflightProfilePromise && inflightProfileUid === uid && !opts.force) {
+                return inflightProfilePromise;
+            }
+            var staleCached = null;
+            if (!opts.force && uid && piiCache) {
+                staleCached = typeof piiCache.loadProfile === 'function'
+                    ? piiCache.loadProfile(uid)
+                    : null;
+                if (!staleCached && typeof piiCache.loadProfileStale === 'function') {
+                    staleCached = piiCache.loadProfileStale(uid);
+                }
+            }
+            inflightProfilePromise = null;
+            inflightProfileUid = uid;
+            var tokenReady = typeof options.getIdToken === 'function'
+                ? Promise.resolve(options.getIdToken()).then(function (token) {
+                    if (token) {
+                        return token;
                     }
-                    return Promise.reject(err);
-                });
+                    return new Promise(function (resolve) {
+                        setTimeout(resolve, 200);
+                    }).then(function () {
+                        return options.getIdToken();
+                    });
+                })
+                : Promise.resolve(null);
+            inflightProfilePromise = tokenReady.then(function (token) {
+                if (inflightProfileUid !== getFirebaseUid()) {
+                    return Promise.reject(new Error('auth uid changed'));
+                }
+                if (typeof options.getIdToken === 'function' && !token) {
+                    clearCachedIdentity(uid);
+                    return Promise.reject(new Error('auth token not ready'));
+                }
+                return profileApi.getMyProfile()
+                    .then(cacheProfile)
+                    .catch(function (err) {
+                        if (isAuthorizationFailure(err)) {
+                            clearCachedIdentity(uid);
+                        } else if (isTransientNetworkFailure(err) && uid && piiCache) {
+                            var cached = piiCache.loadProfile(uid)
+                                || (typeof piiCache.loadProfileStale === 'function'
+                                    ? piiCache.loadProfileStale(uid)
+                                    : null);
+                            if (cached) {
+                                return cached;
+                            }
+                        }
+                        return Promise.reject(err);
+                    });
+            }).finally(function () {
+                if (inflightProfileUid === uid) {
+                    inflightProfilePromise = null;
+                    inflightProfileUid = null;
+                }
+            });
+            if (staleCached) {
+                // キャッシュで即返し、裏で最新を取りに行く
+                void inflightProfilePromise.catch(function () { /* swr background */ });
+                return Promise.resolve(staleCached);
+            }
+            return inflightProfilePromise;
         }
 
         function wrapProfileMutation(fn) {
@@ -129,7 +330,9 @@
                     return list;
                 })
                 .catch(function (err) {
-                    if (uid && piiCache) {
+                    if (isAuthorizationFailure(err)) {
+                        clearCachedIdentity(uid);
+                    } else if (isTransientNetworkFailure(err) && uid && piiCache) {
                         var cached = piiCache.loadShopMembers(uid, shopId);
                         if (cached) {
                             return cached;
@@ -141,17 +344,45 @@
 
         return {
             api: http.request,
+            /** Gate assertion / Firebase ID token（createStaffSdk の getIdToken と同じ） */
+            getAccessToken: typeof options.getIdToken === 'function'
+                ? options.getIdToken
+                : function () { return Promise.resolve(null); },
             clearLocalPiiCache: function () {
+                inflightProfilePromise = null;
+                inflightProfileUid = null;
+                invalidateMyShopsCache();
                 var uid = getFirebaseUid();
                 if (uid && piiCache) {
                     piiCache.clearAll(uid);
                 }
             },
-            getMyShops: function () {
-                return http.get(staffPaths.myShops());
+            /** ログアウト時: 全 uid の PII + 店舗コンテキストを破棄 */
+            clearAllLocalAuthCaches: function () {
+                inflightProfilePromise = null;
+                inflightProfileUid = null;
+                invalidateMyShopsCache();
+                if (piiCache && typeof piiCache.clearAllUsers === 'function') {
+                    piiCache.clearAllUsers();
+                } else {
+                    var uid = getFirebaseUid();
+                    if (uid && piiCache) {
+                        piiCache.clearAll(uid);
+                    }
+                }
+                if (shopContext && typeof shopContext.invalidate === 'function') {
+                    shopContext.invalidate();
+                }
+            },
+            invalidateMyShopsCache: invalidateMyShopsCache,
+            getMyShops: function (query) {
+                return getMyShopsCached(query);
             },
             createShop: function (payload) {
-                return http.post(staffPaths.createShop(), payload);
+                return http.post(staffPaths.createShop(), payload).then(function (created) {
+                    invalidateMyShopsCache();
+                    return created;
+                });
             },
             getMyProfile: getMyProfileWithCache,
             updateMyProfile: wrapProfileMutation(profileApi.updateMyProfile),
@@ -162,10 +393,25 @@
             syncFirebaseClaims: function () {
                 return http.post(staffPaths.syncFirebaseClaims(), undefined);
             },
-            getShopDashboard: function (shopId, period) {
-                return http.get(core.withQuery(staffPaths.shopDashboard(shopId), {
-                    period: period
-                }));
+            getShopDashboard: function (shopId, period, month, range) {
+                var query = { period: period };
+                if (month != null && String(month).trim() !== '') {
+                    query.month = String(month).trim();
+                }
+                var bounds = range || {};
+                if (bounds.from != null && String(bounds.from).trim() !== '') {
+                    query.from = String(bounds.from).trim();
+                }
+                if (bounds.to != null && String(bounds.to).trim() !== '') {
+                    query.to = String(bounds.to).trim();
+                }
+                return http.get(core.withQuery(staffPaths.shopDashboard(shopId), query));
+            },
+            getShopDashboardMonths: function (shopId) {
+                return http.get(staffPaths.shopDashboardMonths(shopId));
+            },
+            getShopCashDelta: function (shopId, query) {
+                return http.get(core.withQuery(staffPaths.shopCashDelta(shopId), query || {}));
             },
             getOrderPageTemplates: function (shopId) {
                 return http.get(core.withQuery(staffPaths.orderPageTemplates(), {
@@ -182,6 +428,15 @@
                 return http.request(staffPaths.updateSessionMode(shopId), {
                     method: 'PATCH',
                     body: JSON.stringify({ sessionMode: sessionMode })
+                });
+            },
+            getInventoryResetSchedule: function (shopId) {
+                return http.get(staffPaths.inventoryResetSchedule(shopId));
+            },
+            updateInventoryResetSchedule: function (shopId, resetLocalHour) {
+                return http.request(staffPaths.updateInventoryResetSchedule(shopId), {
+                    method: 'PATCH',
+                    body: JSON.stringify({ resetLocalHour: resetLocalHour })
                 });
             },
             updateMaxActiveSessions: function (shopId, maxActiveSessions) {
@@ -219,6 +474,9 @@
             getFixedQrDisplay: function (shopId, tableNo) {
                 return http.get(staffPaths.fixedQrDisplay(shopId, tableNo));
             },
+            staffConnectFixedQr: function (payload) {
+                return http.post(staffPaths.staffConnectFixedQr(), payload || {});
+            },
             getActiveSessions: function (shopId, options) {
                 var opts = options || {};
                 var query = { shopId: shopId };
@@ -236,14 +494,42 @@
             createSession: function (shopId, payload) {
                 return http.post(staffPaths.createSession(shopId), payload);
             },
-            checkoutSession: function (sessionId) {
-                return http.post(staffPaths.checkoutSession(sessionId));
+            checkoutSession: function (sessionId, body) {
+                return http.post(staffPaths.checkoutSession(sessionId), body || {});
+            },
+            ackStaffRequest: function (sessionId) {
+                return http.post(staffPaths.ackStaffRequest(sessionId), {});
+            },
+            updateShopProfile: function (shopId, body) {
+                return http.patch(staffPaths.updateShopProfile(shopId), body || {});
+            },
+            uploadShopBanner: function (shopId, file) {
+                var form = new FormData();
+                form.append('file', file);
+                return http.request(staffPaths.uploadShopBanner(shopId), {
+                    method: 'POST',
+                    body: form
+                });
+            },
+            uploadShopLogo: function (shopId, file) {
+                var form = new FormData();
+                form.append('file', file);
+                return http.request(staffPaths.uploadShopLogo(shopId), {
+                    method: 'POST',
+                    body: form
+                });
+            },
+            getShopReceiptLogo: function (shopId) {
+                return http.get(staffPaths.shopReceiptLogo(shopId));
             },
             getSessionDetail: function (sessionId, options) {
                 var opts = options || {};
                 var query = {};
                 if (opts.includeOrders === false) {
                     query.includeOrders = false;
+                }
+                if (opts.shopId != null && String(opts.shopId).trim() !== '') {
+                    query.shopId = opts.shopId;
                 }
                 return http.get(core.withQuery(staffPaths.sessionDetail(sessionId), query))
                     .then(core.normalizeSessionDetailResponse);
@@ -266,6 +552,32 @@
                     body: JSON.stringify({ memo: memo != null ? memo : '' })
                 });
             },
+            updateSessionGuestCounts: function (sessionId, counts) {
+                var body = counts || {};
+                var payload = {
+                    male: body.male != null ? Number(body.male) : 0,
+                    female: body.female != null ? Number(body.female) : 0,
+                    unset: body.unset != null ? Number(body.unset) : 0,
+                    boys: body.boys != null ? Number(body.boys) : 0,
+                    girls: body.girls != null ? Number(body.girls) : 0
+                };
+                if (body.boys == null && body.girls == null && body.children != null) {
+                    payload.children = Number(body.children) || 0;
+                }
+                if (body.family != null) {
+                    payload.family = !!body.family;
+                }
+                if (body.couple != null) {
+                    payload.couple = !!body.couple;
+                }
+                if (body.companions != null) {
+                    payload.companions = !!body.companions;
+                }
+                return http.request(staffPaths.sessionGuestCounts(sessionId), {
+                    method: 'PATCH',
+                    body: JSON.stringify(payload)
+                });
+            },
             markOrderServed: function (orderId) {
                 return http.post(staffPaths.markOrderServed(orderId));
             },
@@ -275,18 +587,23 @@
                     quantity: quantity != null ? quantity : 1
                 });
             },
-            connectOrderEvents: function (shopId, handlers) {
-                var h = handlers || {};
-                return sse.connectAsync({
-                    url: apiBaseUrl + staffPaths.orderEventsSse(),
-                    query: { shopId: shopId },
-                    fetchTicket: function () {
-                        return issueSseTicket(http, shopId);
-                    },
-                    eventName: 'order-update',
-                    onMessage: wrapSseHandler(h.onOrderUpdate),
-                    onOpen: h.onOpen,
-                    onError: h.onError
+            cancelOrderLine: function (orderId, lineIndex, quantity, payload) {
+                var body = payload || {};
+                return http.post(staffPaths.cancelOrderLine(orderId), {
+                    lineIndex: lineIndex,
+                    quantity: quantity != null ? quantity : 1,
+                    cancelType: body.cancelType || 'OTHER',
+                    reason: body.reason != null ? body.reason : ''
+                });
+            },
+            cancelOrder: function (orderId, payload) {
+                var body = payload || {};
+                return http.request(staffPaths.cancelOrder(orderId), {
+                    method: 'DELETE',
+                    body: JSON.stringify({
+                        cancelType: body.cancelType || 'OTHER',
+                        reason: body.reason != null ? body.reason : ''
+                    })
                 });
             },
             connectShopOrderEvents: function (shopId, realtimeHandler, handlers) {
@@ -345,18 +662,20 @@
                 return http.delete(staffPaths.removeMember(shopId, publicId));
             },
             getManageMenus: function (shopId) {
-                return Promise.all([
-                    http.get(staffPaths.manageMenus(shopId)),
-                    http.get(staffPaths.shopInventory(shopId)).catch(function () { return []; })
-                ]).then(function (pair) {
-                    var menus = Array.isArray(pair[0]) ? pair[0] : [];
-                    var inventory = Array.isArray(pair[1]) ? pair[1] : [];
-                    var ui = global.MasterOrderStaffUiSdk;
-                    if (ui && typeof ui.mergeMenusWithInventory === 'function') {
-                        return ui.mergeMenusWithInventory(menus, inventory);
-                    }
-                    return menus;
+                return loadManageMenusBundle(shopId).then(function (bundle) {
+                    return bundle.menus;
                 });
+            },
+            getManageMenusWithSubscribe: function (shopId) {
+                return loadManageMenusBundle(shopId);
+            },
+            peekShopSubscribe: function (shopId) {
+                return shopContext ? shopContext.peekSubscribe(shopId) : null;
+            },
+            invalidateShopContext: function (shopId) {
+                if (shopContext) {
+                    shopContext.invalidate(shopId);
+                }
             },
             getManageMenuLimits: function (shopId) {
                 return http.get(staffPaths.manageMenuLimits(shopId));
@@ -364,10 +683,26 @@
             createMenu: function (shopId, payload) {
                 return http.post(staffPaths.createMenu(shopId), payload);
             },
-            updateMenu: function (menuId, payload) {
+            buildMenuUpdateBaseline: function (menu) {
+                return menuMutation ? menuMutation.buildMenuUpdateBaseline(menu) : null;
+            },
+            updateMenu: function (menuId, payload, options) {
+                options = options || {};
+                var body = payload || {};
+                if (menuMutation) {
+                    body = Object.assign({}, body, menuMutation.normalizeMenuUpdatePayload(body));
+                    if (!options.force && options.baseline != null
+                            && !menuMutation.isMenuUpdatePayloadDirty(options.baseline, body)) {
+                        return Promise.resolve(Object.assign({
+                            unchanged: true,
+                            skipped: true,
+                            id: menuId
+                        }, options.unchangedShape || {}));
+                    }
+                }
                 return http.request(staffPaths.updateMenu(menuId), {
                     method: 'PUT',
-                    body: JSON.stringify(payload || {})
+                    body: JSON.stringify(body)
                 });
             },
             uploadMenuImage: function (menuId, file) {
@@ -387,7 +722,10 @@
             publishCatalog: function (shopId, target) {
                 return http.post(staffPaths.publishCatalog(shopId, target || 'all'), {});
             },
-            getShopSubscribe: function (shopId) {
+            getShopSubscribe: function (shopId, requestOptions) {
+                if (shopContext) {
+                    return shopContext.getSubscribe(http, staffPaths.shopSubscribe, shopId, requestOptions || {});
+                }
                 return http.get(staffPaths.shopSubscribe(shopId));
             },
             createBillingCheckoutSession: function (shopId, payload) {
@@ -401,6 +739,39 @@
             },
             createBillingPortalSession: function (shopId) {
                 return http.post(staffPaths.billingPortalSession(shopId), {});
+            },
+            cancelBillingSubscription: function (shopId, payload) {
+                return http.post(staffPaths.billingCancelSubscription(shopId), payload || {});
+            },
+            acknowledgePlayPurchase: function (shopId, payload) {
+                return http.post(staffPaths.billingPlayAcknowledge(shopId), payload || {});
+            },
+            getDefenseSettings: function (shopId) {
+                return http.get(staffPaths.defenseSettings(shopId));
+            },
+            updateDefenseSettings: function (shopId, body) {
+                return http.patch(staffPaths.updateDefenseSettings(shopId), body || {});
+            },
+            createGuestBan: function (shopId, body) {
+                return http.post(staffPaths.createGuestBan(shopId), body || {});
+            },
+            guestBanAction: function (shopId, body) {
+                return http.post(staffPaths.guestBanAction(shopId), body || {});
+            },
+            approveGuestBanRequest: function (shopId, requestId) {
+                return http.post(staffPaths.approveGuestBanRequest(shopId, requestId), {});
+            },
+            denyGuestBanRequest: function (shopId, requestId) {
+                return http.post(staffPaths.denyGuestBanRequest(shopId, requestId), {});
+            },
+            lookupGuestBan: function (shopId, query) {
+                return http.get(core.withQuery(staffPaths.lookupGuestBan(shopId), query || {}));
+            },
+            liftGuestBan: function (shopId, banId) {
+                return http.delete(staffPaths.liftGuestBan(shopId, banId));
+            },
+            clearGuestIpRisk: function (orderId, body) {
+                return http.patch(staffPaths.clearGuestIpRisk(orderId), body || { cleared: true });
             },
             getToppingGroupsByShop: function (shopId) {
                 return http.get(staffPaths.toppingGroups(shopId));
@@ -436,18 +807,73 @@
                 });
             },
             getShopInventorySummary: function (shopId) {
-                return http.get(staffPaths.shopInventory(shopId));
+                return withInventoryGuard(shopId, function () {
+                    return http.get(staffPaths.shopInventory(shopId));
+                });
             },
-            staffManualInventoryUpdate: function (menuId, payload) {
+            staffManualInventoryUpdate: function (menuId, payload, shopId) {
+                if (shopId) {
+                    return withInventoryGuard(shopId, function () {
+                        return http.post(staffPaths.staffManualInventoryUpdate(menuId), payload || {});
+                    });
+                }
                 return http.post(staffPaths.staffManualInventoryUpdate(menuId), payload || {});
             },
             resetInventoryToInitial: function (shopId, menuIds) {
-                return http.post(staffPaths.resetInventoryToInitial(shopId), {
-                    menuIds: Array.isArray(menuIds) ? menuIds : []
+                return withInventoryGuard(shopId, function () {
+                    return http.post(staffPaths.resetInventoryToInitial(shopId), {
+                        menuIds: Array.isArray(menuIds) ? menuIds : []
+                    });
+                });
+            },
+            resetAllInventoryToInitial: function (shopId) {
+                return withInventoryGuard(shopId, function () {
+                    return http.post(staffPaths.resetAllInventoryToInitial(shopId), {});
                 });
             },
             getShopMenuCategories: function (shopId) {
                 return http.get(staffPaths.menuCategories(shopId));
+            },
+            getPromotionGroups: function (shopId) {
+                return http.get(staffPaths.promotionGroups(shopId));
+            },
+            createPromotionGroup: function (shopId, payload) {
+                return http.post(staffPaths.createPromotionGroup(shopId), payload || {});
+            },
+            updatePromotionGroup: function (groupId, payload) {
+                return http.request(staffPaths.updatePromotionGroup(groupId), {
+                    method: 'PUT',
+                    body: JSON.stringify(payload || {})
+                });
+            },
+            updatePromotionGroupOffSaleLink: function (groupId, payload) {
+                return http.request(staffPaths.updatePromotionGroupOffSaleLink(groupId), {
+                    method: 'PATCH',
+                    body: JSON.stringify(payload || {})
+                });
+            },
+            updatePromotionGroupBannerDisplay: function (groupId, payload) {
+                return http.request(staffPaths.updatePromotionGroupBannerDisplay(groupId), {
+                    method: 'PATCH',
+                    body: JSON.stringify(payload || {})
+                });
+            },
+            deletePromotionGroup: function (groupId) {
+                return http.delete(staffPaths.deletePromotionGroup(groupId));
+            },
+            setPromotionGroupPaused: function (groupId, paused) {
+                return http.post(staffPaths.setPromotionGroupPaused(groupId), { paused: !!paused });
+            },
+            uploadPromotionGroupBanner: function (groupId, file) {
+                var form = new FormData();
+                form.append('file', file);
+                return http.request(staffPaths.uploadPromotionGroupBanner(groupId), {
+                    method: 'POST',
+                    body: form
+                });
+            },
+            deletePromotionGroupBanner: function (groupId) {
+                return http.delete(staffPaths.deletePromotionGroupBanner(groupId));
             },
             createMenuCategory: function (shopId, payload) {
                 return http.post(staffPaths.createMenuCategory(shopId), payload || {});
@@ -481,13 +907,105 @@
             },
             removeRecommendMenuBanner: function (shopId, menuId) {
                 return http.delete(staffPaths.deleteRecommendMenuBanner(shopId, menuId));
+            },
+            updateRecommendMenuBannerLink: function (shopId, menuId, payload) {
+                return http.patch(staffPaths.updateRecommendMenuBannerLink(shopId, menuId), payload || {});
+            },
+            getGuestTopLayout: function (shopId) {
+                return http.get(staffPaths.guestTopLayout(shopId));
+            },
+            saveGuestTopLayout: function (shopId, payload) {
+                return http.request(staffPaths.updateGuestTopLayout(shopId), {
+                    method: 'PUT',
+                    body: JSON.stringify(payload || {})
+                });
+            },
+            uploadGuestTopTileImage: function (shopId, file) {
+                var form = new FormData();
+                form.append('file', file);
+                return http.request(staffPaths.uploadGuestTopTileImage(shopId), {
+                    method: 'POST',
+                    body: form
+                });
+            },
+            listGuestBanners: function (shopId) {
+                return http.get(staffPaths.listGuestBanners(shopId)).then(function (raw) {
+                    if (Array.isArray(raw)) return raw;
+                    return Array.isArray(raw && raw.items) ? raw.items : [];
+                });
+            },
+            guestBannerQuota: function (shopId) {
+                return http.get(staffPaths.guestBannerQuota(shopId));
+            },
+            createGuestBanner: function (shopId, payload) {
+                return http.post(staffPaths.createGuestBanner(shopId), payload || {});
+            },
+            createGuestBannerWithImage: function (shopId, file, payload) {
+                var form = new FormData();
+                form.append('file', file);
+                if (payload != null) {
+                    form.append(
+                        'payload',
+                        new Blob([JSON.stringify(payload)], { type: 'application/json' })
+                    );
+                }
+                return http.request(staffPaths.createGuestBannerWithImage(shopId), {
+                    method: 'POST',
+                    body: form
+                });
+            },
+            reorderGuestBanners: function (shopId, bannerIdsInOrder) {
+                return http.post(
+                    staffPaths.reorderGuestBanners(shopId),
+                    Array.isArray(bannerIdsInOrder) ? bannerIdsInOrder : []
+                );
+            },
+            updateGuestBanner: function (shopId, bannerId, payload) {
+                return http.patch(staffPaths.updateGuestBanner(shopId, bannerId), payload || {});
+            },
+            uploadGuestBannerImage: function (shopId, bannerId, file) {
+                var form = new FormData();
+                form.append('file', file);
+                return http.request(staffPaths.uploadGuestBannerImage(shopId, bannerId), {
+                    method: 'POST',
+                    body: form
+                });
+            },
+            deleteGuestBanner: function (shopId, bannerId) {
+                return http.delete(staffPaths.deleteGuestBanner(shopId, bannerId));
+            },
+            getSessionScript: function (shopId) {
+                return http.get(staffPaths.sessionScript(shopId));
+            },
+            replaceSessionScript: function (shopId, payload) {
+                return http.request(staffPaths.updateSessionScript(shopId), {
+                    method: 'PUT',
+                    body: JSON.stringify(payload || {})
+                });
+            },
+            getDiscountPresets: function (shopId) {
+                return http.get(staffPaths.discountPresets(shopId));
+            },
+            replaceDiscountPresets: function (shopId, payload) {
+                return http.request(staffPaths.updateDiscountPresets(shopId), {
+                    method: 'PUT',
+                    body: JSON.stringify(payload || {})
+                });
+            },
+            applyDiscountPreset: function (sessionId, presetId) {
+                var q = '?sessionId=' + encodeURIComponent(String(sessionId || ''));
+                return http.request(staffPaths.applyDiscountPreset() + q, {
+                    method: 'POST',
+                    body: JSON.stringify({ presetId: presetId })
+                });
+            },
+            approveDiscountPresetRequest: function (shopId, requestId) {
+                return http.post(staffPaths.approveDiscountPresetRequest(shopId, requestId), {});
+            },
+            denyDiscountPresetRequest: function (shopId, requestId) {
+                return http.post(staffPaths.denyDiscountPresetRequest(shopId, requestId), {});
             }
         };
-    }
-
-    /** @deprecated createStaffSdk を使用 */
-    function createClientSdk(options) {
-        return createStaffSdk(options);
     }
 
     /**
@@ -604,10 +1122,14 @@
                     return Promise.resolve();
                 case TYPE.ORDER_UPDATED:
                     if (pendingLoader) {
-                        pendingLoader.scheduleLoad({ silent: true, immediate: true, forceRender: true });
+                        // 署名一致時は再描画スキップ（forceRender しない）
+                        pendingLoader.scheduleLoad({ silent: true, immediate: true });
                     }
                     if (options.onOrderUpdated) {
                         return Promise.resolve(options.onOrderUpdated(ev));
+                    }
+                    if (options.onRefreshAll) {
+                        return Promise.resolve(options.onRefreshAll());
                     }
                     if (ev.sessionId && options.isSessionDetailOpenFor
                         && options.isSessionDetailOpenFor(ev.sessionId)
@@ -621,13 +1143,44 @@
                     if (options.onSessionOpenedOrUpdated) {
                         return Promise.resolve(options.onSessionOpenedOrUpdated(ev));
                     }
+                    if (pendingLoader) {
+                        pendingLoader.scheduleLoad({ silent: true, immediate: true });
+                    }
+                    if (options.onRefreshAll) {
+                        return Promise.resolve(options.onRefreshAll());
+                    }
                     return Promise.resolve();
                 case TYPE.SESSION_CLOSED:
                     if (pendingLoader) {
-                        pendingLoader.scheduleLoad({ silent: true, immediate: true, forceRender: true });
+                        pendingLoader.scheduleLoad({ silent: true, immediate: true });
                     }
                     if (options.onSessionClosed) {
                         return Promise.resolve(options.onSessionClosed(ev));
+                    }
+                    return Promise.resolve();
+                case TYPE.STAFF_REQUEST:
+                    if (options.onStaffRequest) {
+                        return Promise.resolve(options.onStaffRequest(ev));
+                    }
+                    if (options.onSessionOpenedOrUpdated) {
+                        return Promise.resolve(options.onSessionOpenedOrUpdated(ev));
+                    }
+                    if (pendingLoader) {
+                        pendingLoader.scheduleLoad({ silent: true, immediate: true });
+                    }
+                    if (options.onRefreshAll) {
+                        return Promise.resolve(options.onRefreshAll());
+                    }
+                    return Promise.resolve();
+                case TYPE.ANALYTICS_UPDATED:
+                    if (options.onAnalyticsUpdated) {
+                        return Promise.resolve(options.onAnalyticsUpdated(ev));
+                    }
+                    if (options.onOrderUpdated) {
+                        return Promise.resolve(options.onOrderUpdated(ev));
+                    }
+                    if (options.onRefreshAll) {
+                        return Promise.resolve(options.onRefreshAll());
                     }
                     return Promise.resolve();
                 default:
@@ -651,13 +1204,22 @@
         var usesGrid = options.usesTableSeatGrid;
         var enrichInflight = null;
 
+        function shouldEnrichFromApi() {
+            if (!sessionCache || !staffSdk) {
+                return false;
+            }
+            if (typeof isActive === 'function' && isActive()) {
+                return true;
+            }
+            return typeof usesGrid === 'function' && usesGrid();
+        }
+
         function shouldRefreshGrid() {
-            return !!(sessionCache && staffSdk
-                && typeof usesGrid === 'function' && usesGrid());
+            return shouldEnrichFromApi() && typeof usesGrid === 'function' && usesGrid();
         }
 
         function shouldRefresh(sessionId) {
-            return !!(sessionId && shouldRefreshGrid());
+            return !!(sessionId && shouldEnrichFromApi());
         }
 
         function notifySessionsChanged(sessions, row, touched) {
@@ -676,7 +1238,7 @@
 
         function enrichSessionsFromApi(options) {
             options = options || {};
-            if (!shouldRefreshGrid()) {
+            if (!shouldEnrichFromApi()) {
                 return Promise.resolve([]);
             }
             var shopId = typeof getShopId === 'function' ? getShopId() : null;
@@ -701,7 +1263,11 @@
                             ? sessionCache.patchTotalsFromList(list)
                             : []);
                     var sessions = sessionCache.getSessions();
-                    notifySessionsChanged(sessions, null, touched);
+                    // 触った席が1件なら単一カード更新（他卓への全 reconcile を避ける）
+                    var singleRow = Array.isArray(touched) && touched.length === 1
+                        ? touched[0]
+                        : null;
+                    notifySessionsChanged(sessions, singleRow, touched);
                     return touched;
                 })
                 .catch(function () {
@@ -737,6 +1303,10 @@
                         notifySessionsChanged(sessionCache.getSessions(), row, [row]);
                     }
                     return row;
+                })
+                .catch(function () {
+                    handleRefreshError();
+                    return null;
                 });
         }
 
@@ -780,7 +1350,6 @@
         STAFF_SESSION_UPDATED_EVENT: STAFF_SESSION_UPDATED_EVENT,
         emitStaffSessionUpdated: emitStaffSessionUpdated,
         createStaffSdk: createStaffSdk,
-        createClientSdk: createClientSdk,
         createPendingOrdersLoader: createPendingOrdersLoader,
         createShopRealtimeHandler: createShopRealtimeHandler,
         createKiteiFirestoreRealtimeHooks: createKiteiFirestoreRealtimeHooks,
@@ -791,5 +1360,4 @@
     };
 
     global.MasterOrderStaffSdk = staffApi;
-    global.MasterOrderClientSdk = staffApi;
 })(typeof window !== 'undefined' ? window : globalThis);

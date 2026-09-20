@@ -7,8 +7,151 @@
 (function (global) {
     'use strict';
 
-    var SDK_VERSION = '1.0.0';
+    var SDK_VERSION = '1.1.1';
     var DEFAULT_QR_PX = 184;
+
+    function resolveCardPassPhrase(card) {
+        var kitei = global.MasterOrderStaffKiteiSdk;
+        if (kitei && typeof kitei.getSeatCardPassPhrase === 'function') {
+            var fromMap = kitei.getSeatCardPassPhrase(card);
+            if (fromMap) {
+                return String(fromMap);
+            }
+        }
+        return card && card.dataset ? String(card.dataset.qrPassPhrase || '') : '';
+    }
+
+    function rememberCardPassPhrase(card, passPhrase) {
+        var kitei = global.MasterOrderStaffKiteiSdk;
+        if (kitei && typeof kitei.setSeatCardPassPhrase === 'function') {
+            kitei.setSeatCardPassPhrase(card, passPhrase);
+            if (card && card.dataset) {
+                delete card.dataset.qrPassPhrase;
+            }
+            return;
+        }
+        if (card && card.dataset) {
+            card.dataset.qrPassPhrase = String(passPhrase);
+        }
+    }
+
+    function displayPathSlug(value) {
+        var raw = String(value || '').trim();
+        if (!raw) {
+            return '';
+        }
+        var cleaned = raw.replace(/[/\\?#%\u0000-\u001F\u007F]/g, '');
+        cleaned = cleaned.replace(/\s+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+        return cleaned;
+    }
+
+    function normalizeGuestRouteSlugSegment(segment) {
+        var raw = String(segment || '').trim();
+        if (!raw) {
+            return '';
+        }
+        try {
+            return decodeURIComponent(raw);
+        } catch (_) {
+            return raw;
+        }
+    }
+
+    function parseShopSlugFromGuestPath(pathname) {
+        var parts = String(pathname || '/').split('/').filter(Boolean);
+        if (parts.length >= 2 && String(parts[0]).toLowerCase() === 'shop') {
+            return displayPathSlug(normalizeGuestRouteSlugSegment(parts[1]));
+        }
+        return '';
+    }
+
+    function staffQrShopMatches(scannedSlug, currentSlug) {
+        var scanned = displayPathSlug(scannedSlug);
+        var current = displayPathSlug(currentSlug);
+        if (!scanned || !current) {
+            return false;
+        }
+        return scanned.toLowerCase() === current.toLowerCase();
+    }
+
+    /**
+     * スタッフがカメラで読んだ QR を分類する。来客 open には使わない。
+     * @returns {null|{kind:string,shopSlug?:string,tableNo?:number,passPhrase?:string,sessionId?:string,pin?:string,joinToken?:string}}
+     */
+    function parseStaffQrScanText(raw) {
+        var text = String(raw || '').trim();
+        if (!text) {
+            return null;
+        }
+        var parsed = null;
+        try {
+            parsed = new URL(text, 'https://order.local');
+        } catch (_) {
+            parsed = null;
+        }
+        var shopSlug = parsed ? parseShopSlugFromGuestPath(parsed.pathname) : '';
+        var params = parsed ? parsed.searchParams : null;
+        var hashBody = parsed ? String(parsed.hash || '').replace(/^#/, '') : '';
+        var hashParams = new URLSearchParams(hashBody.charAt(0) === '?' ? hashBody : (hashBody ? '?' + hashBody : ''));
+
+        function param(name) {
+            var fromSearch = params ? String(params.get(name) || '').trim() : '';
+            if (fromSearch) {
+                return fromSearch;
+            }
+            return String(hashParams.get(name) || '').trim();
+        }
+
+        var tableNo = Number(param('tableNo') || param('table') || 0);
+        if (!(tableNo > 0) && parsed) {
+            var pathParts = String(parsed.pathname || '').split('/').filter(Boolean);
+            if (pathParts.length >= 3
+                    && String(pathParts[0]).toLowerCase() === 'shop'
+                    && /^\d+$/.test(pathParts[2])) {
+                tableNo = Number(pathParts[2]);
+            }
+        }
+        var passPhrase = param('passPhrase');
+        if (tableNo > 0 && passPhrase) {
+            return {
+                kind: 'fixed',
+                tableNo: tableNo,
+                passPhrase: passPhrase,
+                shopSlug: shopSlug
+            };
+        }
+        var joinToken = param('join');
+        if (joinToken) {
+            return { kind: 'join', joinToken: joinToken, shopSlug: shopSlug };
+        }
+        var sessionId = param('id') || param('sessionId') || param('session');
+        var pin = param('pass') || param('pin');
+        if (sessionId && pin) {
+            return {
+                kind: 'credentials',
+                sessionId: sessionId,
+                pin: pin,
+                shopSlug: shopSlug
+            };
+        }
+        if (sessionId) {
+            return { kind: 'session', sessionId: sessionId, shopSlug: shopSlug };
+        }
+        if (parsed) {
+            var parts = String(parsed.pathname || '').split('/').filter(Boolean);
+            var i;
+            for (i = parts.length - 1; i >= 0; i -= 1) {
+                var part = parts[i];
+                if (/^[0-9a-fA-F-]{8,}$/.test(part) && part.indexOf('-') >= 0) {
+                    return { kind: 'session', sessionId: part, shopSlug: shopSlug };
+                }
+            }
+        }
+        if (/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(text)) {
+            return { kind: 'session', sessionId: text, shopSlug: '' };
+        }
+        return null;
+    }
 
     function tableQrToDataUrl(tableEl, width, height) {
         if (!tableEl || !tableEl.rows || !tableEl.rows.length) {
@@ -122,7 +265,7 @@
         }
 
         function buildShopScopedGuestPath(shopSlug) {
-            var slug = String(shopSlug || '').trim();
+            var slug = displayPathSlug(shopSlug) || String(shopSlug || '').trim();
             if (!slug) {
                 return '';
             }
@@ -192,7 +335,11 @@
             return String(sessionId || '') + '|' + String(entryPin || '').trim().toUpperCase();
         }
 
-        function fixedQrCacheKey(tableNo, passPhrase) {
+        function fixedQrCacheKey(tableNo, passPhrase, connectUrl) {
+            var url = String(connectUrl || '').trim();
+            if (url) {
+                return 'u|' + url;
+            }
             var shopId = typeof getShopId === 'function' ? getShopId() : '';
             return String(shopId || '') + '|' + String(tableNo || '') + '|' + String(passPhrase || '');
         }
@@ -461,15 +608,19 @@
             sessionCardQrPumpScheduled = false;
         }
 
-        function generateFixedQrDataUrl(tableNo, passPhrase) {
-            return generateQrDataUrlFromText(buildFixedQrConnectUrl(tableNo, passPhrase));
+        function generateFixedQrDataUrl(tableNo, passPhrase, connectUrl) {
+            var url = String(connectUrl || '').trim();
+            if (!url) {
+                url = buildFixedQrConnectUrl(tableNo, passPhrase);
+            }
+            return generateQrDataUrlFromText(url);
         }
 
-        function applyFixedQrToWrap(qrWrap, qrImg, qrCaption, tableNo, passPhrase) {
-            var cacheKey = fixedQrCacheKey(tableNo, passPhrase);
+        function applyFixedQrToWrap(qrWrap, qrImg, qrCaption, tableNo, passPhrase, connectUrl) {
+            var cacheKey = fixedQrCacheKey(tableNo, passPhrase, connectUrl);
             var dataUrl = sessionQrCache.get(cacheKey);
             if (!dataUrl) {
-                dataUrl = generateFixedQrDataUrl(tableNo, passPhrase);
+                dataUrl = generateFixedQrDataUrl(tableNo, passPhrase, connectUrl);
                 if (dataUrl) {
                     sessionQrCache.set(cacheKey, dataUrl);
                 }
@@ -481,7 +632,7 @@
                 if (qrCaption) {
                     qrCaption.style.display = '';
                     qrCaption.style.visibility = '';
-                    var fixedUrl = buildFixedQrConnectUrl(tableNo, passPhrase);
+                    var fixedUrl = String(connectUrl || '').trim() || buildFixedQrConnectUrl(tableNo, passPhrase);
                     if (!fixedUrl) {
                         qrCaption.textContent = '来客URLを組み立てできません';
                     } else if (typeof global.QRCode === 'undefined') {
@@ -510,10 +661,11 @@
             if (!isSessionsTabActive()) {
                 return;
             }
-            var cacheKey = fixedQrCacheKey(job.tableNo, job.passPhrase);
+            var connectUrl = job.connectUrl || '';
+            var cacheKey = fixedQrCacheKey(job.tableNo, job.passPhrase, connectUrl);
             if (sessionQrCache.has(cacheKey) || fixedQrLoadQueuedKeys.has(cacheKey)) {
                 if (job.qrWrap && job.qrWrap.isConnected && sessionQrCache.has(cacheKey)) {
-                    applyFixedQrToWrap(job.qrWrap, job.qrImg, job.qrCaption, job.tableNo, job.passPhrase);
+                    applyFixedQrToWrap(job.qrWrap, job.qrImg, job.qrCaption, job.tableNo, job.passPhrase, connectUrl);
                 }
                 return;
             }
@@ -535,19 +687,20 @@
                 if (!next) {
                     return;
                 }
-                var nextKey = fixedQrCacheKey(next.tableNo, next.passPhrase);
+                var nextKey = fixedQrCacheKey(next.tableNo, next.passPhrase, next.connectUrl);
                 fixedQrLoadQueuedKeys.delete(nextKey);
                 var qrWrap = next.qrWrap;
                 var qrImg = next.qrImg;
                 var qrCaption = next.qrCaption;
                 var tableNo = next.tableNo;
                 var passPhrase = next.passPhrase;
+                var nextConnectUrl = next.connectUrl || '';
                 if (!qrWrap || !qrWrap.isConnected) {
                     pump();
                     return;
                 }
                 if (sessionQrCache.has(nextKey)) {
-                    applyFixedQrToWrap(qrWrap, qrImg, qrCaption, tableNo, passPhrase);
+                    applyFixedQrToWrap(qrWrap, qrImg, qrCaption, tableNo, passPhrase, nextConnectUrl);
                     global.setTimeout(pump, 0);
                     return;
                 }
@@ -558,7 +711,7 @@
                         hideQrLoadingOverlay(qrWrap);
                         return;
                     }
-                    applyFixedQrToWrap(qrWrap, qrImg, qrCaption, tableNo, passPhrase);
+                    applyFixedQrToWrap(qrWrap, qrImg, qrCaption, tableNo, passPhrase, nextConnectUrl);
                 }
 
                 if (typeof global.requestIdleCallback === 'function') {
@@ -587,7 +740,8 @@
                         return;
                     }
                     var tableNo = Number(card.dataset.qrTableNo || card.dataset.tableNo || 0);
-                    var passPhrase = card.dataset.qrPassPhrase || '';
+                    var passPhrase = resolveCardPassPhrase(card);
+                    var connectUrl = card.dataset.qrConnectUrl || '';
                     var qrWrap = card.querySelector('.session-qr-wrap');
                     var qrImg = card.querySelector('.session-qr-img');
                     var qrCaption = card.querySelector('.session-qr-caption');
@@ -595,12 +749,19 @@
                         card.removeAttribute('data-qr-pending');
                         return;
                     }
-                    enqueueFixedQrLoad({ qrWrap: qrWrap, qrImg: qrImg, qrCaption: qrCaption, tableNo: tableNo, passPhrase: passPhrase });
+                    enqueueFixedQrLoad({
+                        qrWrap: qrWrap,
+                        qrImg: qrImg,
+                        qrCaption: qrCaption,
+                        tableNo: tableNo,
+                        passPhrase: passPhrase,
+                        connectUrl: connectUrl
+                    });
                 });
             }, { root: null, rootMargin: '120px 0px', threshold: 0.05 });
         }
 
-        function scheduleLazyFixedQrForCard(card, tableNo, passPhrase) {
+        function scheduleLazyFixedQrForCard(card, tableNo, passPhrase, connectUrl) {
             if (!card || !passPhrase || !isSessionsTabActive()) {
                 return;
             }
@@ -611,10 +772,15 @@
                 return;
             }
             card.dataset.qrTableNo = String(tableNo || '');
-            card.dataset.qrPassPhrase = String(passPhrase);
-            var cacheKey = fixedQrCacheKey(tableNo, passPhrase);
+            rememberCardPassPhrase(card, passPhrase);
+            if (connectUrl) {
+                card.dataset.qrConnectUrl = String(connectUrl);
+            } else {
+                delete card.dataset.qrConnectUrl;
+            }
+            var cacheKey = fixedQrCacheKey(tableNo, passPhrase, connectUrl);
             if (sessionQrCache.has(cacheKey)) {
-                applyFixedQrToWrap(qrWrap, qrImg, qrCaption, tableNo, passPhrase);
+                applyFixedQrToWrap(qrWrap, qrImg, qrCaption, tableNo, passPhrase, connectUrl);
                 return;
             }
             if (card.dataset.qrObserved === '1') {
@@ -631,7 +797,14 @@
                 fixedQrIntersectionObserver.observe(card);
                 return;
             }
-            enqueueFixedQrLoad({ qrWrap: qrWrap, qrImg: qrImg, qrCaption: qrCaption, tableNo: tableNo, passPhrase: passPhrase });
+            enqueueFixedQrLoad({
+                qrWrap: qrWrap,
+                qrImg: qrImg,
+                qrCaption: qrCaption,
+                tableNo: tableNo,
+                passPhrase: passPhrase,
+                connectUrl: connectUrl
+            });
         }
 
         function finalizeTableSeatQrLoads(wrap) {
@@ -654,8 +827,9 @@
                         fixedQrIntersectionObserver.observe(card);
                     } else {
                         var tableNo = Number(card.dataset.qrTableNo || card.dataset.tableNo || 0);
-                        var passPhrase = card.dataset.qrPassPhrase || '';
-                        scheduleLazyFixedQrForCard(card, tableNo, passPhrase);
+                        var passPhrase = resolveCardPassPhrase(card);
+                        var connectUrl = card.dataset.qrConnectUrl || '';
+                        scheduleLazyFixedQrForCard(card, tableNo, passPhrase, connectUrl);
                     }
                 });
             }, 220);
@@ -734,16 +908,16 @@
             return true;
         }
 
-        function renderFixedQrInto(imgEl, tableNo, passPhrase, captionEl) {
+        function renderFixedQrInto(imgEl, tableNo, passPhrase, captionEl, connectUrl) {
             if (!imgEl) {
                 return;
             }
             var qrWrap = imgEl.closest ? imgEl.closest('.session-qr-wrap') : null;
             if (qrWrap) {
-                applyFixedQrToWrap(qrWrap, imgEl, captionEl, tableNo, passPhrase);
+                applyFixedQrToWrap(qrWrap, imgEl, captionEl, tableNo, passPhrase, connectUrl);
                 return;
             }
-            var cacheKey = fixedQrCacheKey(tableNo, passPhrase);
+            var cacheKey = fixedQrCacheKey(tableNo, passPhrase, connectUrl);
             var cachedDataUrl = sessionQrCache.get(cacheKey);
             if (cachedDataUrl) {
                 imgEl.src = cachedDataUrl;
@@ -754,7 +928,7 @@
                 }
                 return;
             }
-            var dataUrl = generateFixedQrDataUrl(tableNo, passPhrase);
+            var dataUrl = generateFixedQrDataUrl(tableNo, passPhrase, connectUrl);
             if (dataUrl) {
                 sessionQrCache.set(cacheKey, dataUrl);
                 imgEl.src = dataUrl;
@@ -793,6 +967,9 @@
         VERSION: SDK_VERSION,
         DEFAULT_QR_PX: DEFAULT_QR_PX,
         createStaffQrService: createStaffQrService,
-        tableQrToDataUrl: tableQrToDataUrl
+        tableQrToDataUrl: tableQrToDataUrl,
+        parseStaffQrScanText: parseStaffQrScanText,
+        parseShopSlugFromGuestPath: parseShopSlugFromGuestPath,
+        staffQrShopMatches: staffQrShopMatches
     };
 })(typeof window !== 'undefined' ? window : globalThis);

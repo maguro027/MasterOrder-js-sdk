@@ -4,11 +4,11 @@
 
 | ファイル | グローバル | 説明 |
 |----------|------------|------|
-| `order-sdk.js` | `MasterOrderOrderSdk` / `MasterOrderSdk` | セッション・注文・メニュー・QR |
+| `order-sdk.js` | `MasterOrderOrderSdk` / `MasterOrderSdk` | セッション・注文・メニュー・QR・アレルギーフィルタ（8h TTL） |
 | `guest-ui-i18n.js` | `MasterOrderGuestUiI18n` | 来客 UI 文言（ja/en/zh/ko） |
-| `guest-order-ui-sdk.js` | `MasterOrderGuestOrderUiSdk` | カート・履歴・言語ピッカー |
+| `guest-order-ui-sdk.js` | `MasterOrderGuestOrderUiSdk` | カート・履歴・言語/アレルギーピッカー |
 | `guest-firestore-sdk.js` | — | 将来/補助用 Firestore ヘルパー |
 
-**読み込み順:** Core の後に `guest-ui-i18n.js` → `order-sdk.js` → `guest-order-ui-sdk.js`
+**読み込み順:** Core（`allergens.js` 含む）の後に `guest-ui-i18n.js` → `order-sdk.js` → `guest-order-ui-sdk.js`
 
-詳細 API は [ルート README](../README.md) を参照してください。
+アレルゲンの正本ラベル・並び・emoji は **Core `allergens.js`**。Order は言語解決・localStorage・メニュー非表示フィルタを担当する。

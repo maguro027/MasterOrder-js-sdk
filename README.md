@@ -7,7 +7,8 @@ MasterOrder-js-sdk/
 ├── sdk-manifest.json   … レイヤ定義（同期スクリプトが参照）
 ├── core/               … 共通基盤（HTTP, routes, 画像 URL）
 ├── order/              … 来客注文
-└── staff/              … 店舗スタッフ
+├── staff/              … 店舗スタッフ
+└── printer/            … 58mm ESC/POS（独立 IIFE。Staff 遅延チャンクへ連結）
 ```
 
 各フォルダの README にモジュール一覧があります。
@@ -22,12 +23,13 @@ MasterOrder-js-sdk/
 
 | レイヤ | 接続先 | Firebase |
 |--------|--------|----------|
-| **Staff**（店舗スタッフ） | Server `apiBaseUrl`（REST + SSE） | **Auth のみ**（ID トークン） |
-| **Order**（来客） | 同上 | **なし**（PIN + REST） |
+| **Staff**（店舗スタッフ） | Server `apiBaseUrl`（REST + SSE）+ **Firestore 直読**（Rules + Claims） | Auth + Custom Claims（`access` / `shops`） |
+| **Order**（来客） | Server / Gate | **なし**（PIN + REST） |
 | **Server** | Firestore / D1 / KV | Admin SDK |
 
-- ブラウザは **Firestore に直接接続しない**（`core/api-routes.js` が URL を検証）。
-- リアルタイムは Server が Firestore を購読し **SSE** で fan-out。
+- 来客ブラウザは Firestore に直接接続しない。
+- スタッフは `staff-firestore-sdk` で直読可（Claims 同期が前提 — [CUSTOM_CLAIMS](../docs/operations/CUSTOM_CLAIMS_ACCESS_MIGRATION.md)）。
+- リアルタイムの多くは Server が Firestore を購読し **SSE** で fan-out。
 
 ### 3 レイヤ構成
 
@@ -44,7 +46,6 @@ core/menu-image-url.js 画像 URL ユーティリティ（R2、同梱）
 | `core/api-routes.js` | `MasterOrderApiRoutes` | ルートメタデータ + `paths.staff` / `paths.guest` |
 | `core/core-sdk.js` | `MasterOrderCoreSdk` | 共通基盤 |
 | `staff/staff-sdk.js` | `MasterOrderStaffSdk` | 店舗スタッフ（**推奨**） |
-| `staff/client-sdk.js` | — | 互換シム（`staff-sdk.js` 単体で `MasterOrderClientSdk` も設定済み） |
 | `order/order-sdk.js` | `MasterOrderOrderSdk` / `MasterOrderSdk` | 来客 |
 | `core/menu-image-url.js` | `MasterOrderMenuImage` | メニュー画像 URL |
 
@@ -52,34 +53,34 @@ core/menu-image-url.js 画像 URL ユーティリティ（R2、同梱）
 
 ## スクリプト読み込み順
 
-デプロイ先では `sync-js-sdk` が **フラット** に `js/sdk/*.js` へコピーします（パスは従来どおり）。
+デプロイ先では `sync-js-sdk` が **フラット** に `js/sdk/*.js` へコピーし、続けて concat+minify バンドルを生成します。
 
 ### Staff（店舗 UI）
 
 ```html
-<script src="/js/sdk/api-routes.js"></script>
-<script src="/js/sdk/core-sdk.js"></script>
-<script src="/js/sdk/menu-image-url.js"></script>
-<script src="/js/sdk/staff-sdk.js"></script>
-<!-- … staff/*.js を staff/README.md の順で … -->
-<script src="/js/sdk/staff-app-wiring.js"></script>
+<script src="https://www.gstatic.com/firebasejs/.../firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/.../firebase-auth-compat.js"></script>
+<!-- Firestore compat は KITEI 直読時に遅延ロード -->
+<script src="/js/staff-sdk.bundle.js?v=staff-bundle-67"></script>
+<script src="/js/staff-app.bundle.js?v=staff-bundle-67"></script>
+<!-- charts / escpos は staff-sdk.lazy-*.js としてタブ利用時に遅延 -->
 ```
 
 ### Order（来客 UI）
 
 ```html
-<script src="/js/sdk/guest-ui-i18n.js"></script>
-<script src="/js/sdk/api-routes.js"></script>
-<script src="/js/sdk/core-sdk.js"></script>
-<script src="/js/sdk/order-sdk.js"></script>
-<script src="/js/sdk/guest-order-ui-sdk.js"></script>
-<script src="/js/sdk/menu-image-url.js"></script>
+<script src="/js/order-sdk.bundle.js?v=guest-sdk-v15"></script>
+<script src="/js/offline-order.js"></script>
+<!-- QR スキャナは /js/vendor/jsqr.js + /js/sdk/guest-qr-scanner-sdk.js をスキャン開始時に遅延 -->
 ```
 
 | パス（正本） | グローバル | 用途 |
 |--------------|------------|------|
+| `core/allergens.js` | `MasterOrderAllergens` | アレルゲン（JFS/食品表示法順・多言語・emoji） |
 | `order/guest-ui-i18n.js` | `MasterOrderGuestUiI18n` | 来客 UI 文言 |
 | `order/guest-order-ui-sdk.js` | `MasterOrderGuestOrderUiSdk` | カート・履歴描画 |
+| `order/guest-qr-scanner-sdk.js` | `MasterOrderGuestQrScannerSdk` | 来客 QR スキャナ（遅延） |
+| `staff/staff-lazy-loader-sdk.js` | `MasterOrderStaffLazyLoader` | Staff 遅延チャンク読込 |
 
 ---
 
@@ -89,7 +90,7 @@ core/menu-image-url.js 画像 URL ユーティリティ（R2、同梱）
 npm run verify   # core/ order/ staff/ の配置を検証
 ```
 
-`sdk-manifest.json` がレイヤとファイル一覧の正本です。MasterOrder monorepo の `sync-js-sdk.ps1` がこれを読み、Order / Staff / Client へフラットコピーします。
+`sdk-manifest.json` がレイヤとファイル一覧の正本です。MasterOrder monorepo の `sync-js-sdk.ps1` がこれを読み、Order / Staff 静的へフラットコピーします（Client サブモジュールへは `-IncludeClient`）。
 
 ---
 
@@ -113,6 +114,7 @@ npm run verify   # core/ order/ staff/ の配置を検証
 - [core/README.md](./core/README.md)
 - [order/README.md](./order/README.md)
 - [staff/README.md](./staff/README.md)
+- [printer/README.md](./printer/README.md)
 
 ## クイックスタート
 
@@ -257,7 +259,7 @@ if (!result.stale) {
 | `getActiveSessions(shopId, { includeTotals })` | アクティブセッション |
 | `createSession(shopId, payload)` | セッション作成 |
 | `checkoutSession(sessionId)` | 会計 |
-| `getSessionDetail(sessionId, { includeOrders })` | 詳細 |
+| `getSessionDetail(sessionId, { includeOrders, shopId })` | 詳細 |
 | `updateSessionMemo(sessionId, memo)` | メモ更新 |
 | `getArchivedSessions` / `getArchivedSessionDetail` | アーカイブ |
 
@@ -289,8 +291,6 @@ if (!result.stale) {
 | `createShopRealtimeHandler({ pendingLoader, onRefreshAll, ... })` | SSE イベント → UI 更新 |
 | `createStaffRealtimeRuntime({ clientSdk, pendingOrders, realtime })` | ローダー + SSE ハンドラを一括生成 |
 | `createKiteiFirestoreRealtimeHooks({ sessionCache, onSessionsChanged })` | 固定QR: 注文 SSE 後の合計差分更新 |
-
-**後方互換:** `createClientSdk` = `createStaffSdk`、`MasterOrderClientSdk` = `MasterOrderStaffSdk`
 
 ### Staff Firestore SDK（`MasterOrderStaffFirestoreSdk`）
 
@@ -374,14 +374,16 @@ routes.assertNodeApiBaseUrl(baseUrl);  // Firestore URL を拒否
 |--------|--------------|
 | Order 静的 (`Order/.../static/js/sdk/`) | api-routes, core, order, menu-image-url |
 | Staff 静的 (`Order ビルド → /static/staff/js/sdk/`) | api-routes, core, staff, client-shim, menu-image-url |
-| Client リポ (`vendor/MasterOrder-client/source/js/sdk/`) | 同上 Staff |
+| Client リポ (`vendor/MasterOrder-client/source/js/sdk/`) | 同上 Staff（`sync-js-sdk.ps1 -IncludeClient` / `build-staff-apk.ps1` 時のみ） |
 | DebugPages (`DebugPages/js/sdk/`) | api-routes, core, staff |
 
 ```powershell
 .\scripts\sync-js-sdk.ps1
+# APK 用に client サブモジュールへも書くとき:
+.\scripts\sync-js-sdk.ps1 -IncludeClient
 ```
 
-Maven ビルド時も `Order/pom.xml` が `js-sdk/` から自動コピー。
+既定の同期は Order/Staff 静的のみ（サブモジュールを汚さない）。Maven ビルド時も `Order/pom.xml` が `js-sdk/` から自動コピー。
 
 ---
 
