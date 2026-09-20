@@ -1,12 +1,15 @@
 /**
- * メニュー画像 URL（R2 カスタムドメイン）。order-config / client-config の _imageBaseUrl を使用。
+ * メニュー画像 URL（R2 カスタムドメイン）。
+ * 正本キーのみ: menu/converted/{shopPublicId}/{file}
+ * MenuIcon/ は発行しない（旧 URL は shopPublicId があるとき converted へ書き換え）。
  */
 (function (global) {
     'use strict';
 
     var DEFAULT_IMAGE_PUBLIC_BASE = 'https://masterorder-assets.mcservers-wp.com';
-    var MENU_ICON_PREFIX = 'MenuIcon';
-    var LEGACY_SIZE_PREFIXES = ['large/', 'medium/', 'small/'];
+    var MENU_CONVERTED_PREFIX = 'menu/converted';
+    /** R2 再圧縮後に CDN HIT を避ける（Cache Purge 権限が無い環境向け）。 */
+    var MENU_IMAGE_CACHE_PIN = 'r800q72';
 
     function imagePublicBase() {
         var fromConfig = global.window && global.window._imageBaseUrl;
@@ -14,6 +17,35 @@
             return fromConfig.trim().replace(/\/$/, '');
         }
         return DEFAULT_IMAGE_PUBLIC_BASE;
+    }
+
+    function shopPublicId() {
+        var fromConfig = global.window && global.window._shopPublicId;
+        if (typeof fromConfig === 'string' && fromConfig.trim()) {
+            return fromConfig.trim().toLowerCase();
+        }
+        return '';
+    }
+
+    function extractFileName(imageUrl) {
+        if (!imageUrl) {
+            return '';
+        }
+        var key = String(imageUrl).trim();
+        if (key.indexOf('?') >= 0) {
+            key = key.split('?', 2)[0];
+        }
+        if (key.startsWith('http://') || key.startsWith('https://')) {
+            try {
+                key = new URL(key).pathname.replace(/^\/+/, '');
+            } catch (_e) {
+                return '';
+            }
+        } else {
+            key = key.replace(/^\/+/, '');
+        }
+        var slash = key.lastIndexOf('/');
+        return slash >= 0 ? key.substring(slash + 1) : key;
     }
 
     function normalizeImageKey(imageUrl) {
@@ -30,40 +62,74 @@
         } else {
             key = key.replace(/^\/+/, '');
         }
-        return rewriteLegacyMenuImageKey(key);
-    }
-
-    function rewriteLegacyMenuImageKey(key) {
-        if (!key || key.indexOf(MENU_ICON_PREFIX + '/') === 0) {
+        if (key.indexOf('?') >= 0) {
+            key = key.split('?', 2)[0];
+        }
+        if (key.indexOf(MENU_CONVERTED_PREFIX + '/') === 0) {
             return key;
         }
-        for (var i = 0; i < LEGACY_SIZE_PREFIXES.length; i++) {
-            var prefix = LEGACY_SIZE_PREFIXES[i];
-            if (key.indexOf(prefix) === 0) {
-                return MENU_ICON_PREFIX + '/' + key.substring(prefix.length);
-            }
+        // 旧 MenuIcon / large|medium|small → ファイル名だけ残し、組み立ては shopPublicId 必須
+        if (key.indexOf('MenuIcon/') === 0) {
+            return key.substring('MenuIcon/'.length).replace(/^(large|medium|small)\//, '');
+        }
+        if (key.indexOf('large/') === 0 || key.indexOf('medium/') === 0 || key.indexOf('small/') === 0) {
+            return key.replace(/^(large|medium|small)\//, '');
         }
         return key;
     }
 
-    function buildMenuImageUrl(imageUrl, sizePrefix) {
-        var key = normalizeImageKey(imageUrl);
-        if (!key) {
-            return '';
+    /** 公開キー候補（menu/converted のみ） */
+    function menuImageCandidateKeys(imageUrl) {
+        var normalized = normalizeImageKey(imageUrl);
+        if (!normalized) {
+            return [];
         }
-        var base = imagePublicBase();
-        if (key.indexOf('/') >= 0) {
-            return base + '/' + key;
+        if (normalized.indexOf(MENU_CONVERTED_PREFIX + '/') === 0) {
+            return [normalized];
         }
-        return base + '/' + MENU_ICON_PREFIX + '/' + key;
+        if (normalized.indexOf('/') >= 0) {
+            // 未知のパスは出さない（MenuIcon 等）
+            var fileFromPath = extractFileName(normalized);
+            var sidPath = shopPublicId();
+            if (sidPath && fileFromPath) {
+                return [MENU_CONVERTED_PREFIX + '/' + sidPath + '/' + fileFromPath];
+            }
+            return [];
+        }
+        var file = extractFileName(normalized) || normalized;
+        var sid = shopPublicId();
+        if (!sid || !file) {
+            return [];
+        }
+        return [MENU_CONVERTED_PREFIX + '/' + sid + '/' + file];
     }
 
-    /** メニュー UUID / 画像キーから表示 URL */
+    function withMenuImageCachePin(url) {
+        if (!url) {
+            return url;
+        }
+        if (url.indexOf(MENU_CONVERTED_PREFIX + '/') < 0) {
+            return url;
+        }
+        if (url.indexOf('?') >= 0) {
+            return url + '&v=' + MENU_IMAGE_CACHE_PIN;
+        }
+        return url + '?v=' + MENU_IMAGE_CACHE_PIN;
+    }
+
+    function buildMenuImageUrl(imageUrl, sizePrefix) {
+        void sizePrefix;
+        var candidates = menuImageCandidateKeys(imageUrl);
+        if (!candidates.length) {
+            return '';
+        }
+        return withMenuImageCachePin(imagePublicBase() + '/' + candidates[0]);
+    }
+
     function getIcon(uuid) {
         return buildMenuImageUrl(uuid);
     }
 
-    /** メニュー UUID / 画像キーから表示 URL（サイズ廃止・MenuIcon 統一） */
     function getMenuImageUrl(uuid, size) {
         return buildMenuImageUrl(uuid, size);
     }
@@ -72,34 +138,35 @@
         if (imageFallbackUrl) {
             return imageFallbackUrl;
         }
-        var base = (fallbackBase || '').replace(/\/$/, '');
-        if (!base) {
-            var fromWindow = global.window && global.window._imageFallbackBaseUrl;
-            if (typeof fromWindow === 'string' && fromWindow.trim()) {
-                base = fromWindow.trim().replace(/\/$/, '');
-            }
+        void imageUrl;
+        void fallbackBase;
+        // レガシー MenuIcon fallback は廃止
+        return '';
+    }
+
+    function applyMenuImage(img, imageUrl) {
+        if (!img) {
+            return;
         }
-        if (!base) {
-            return '';
+        var url = buildMenuImageUrl(imageUrl);
+        if (!url) {
+            img.removeAttribute('src');
+            return;
         }
-        var key = normalizeImageKey(imageUrl);
-        if (!key) {
-            return '';
-        }
-        if (key.indexOf('/') >= 0) {
-            return base + '/' + key;
-        }
-        return base + '/' + MENU_ICON_PREFIX + '/' + key;
+        img.onerror = null;
+        img.src = url;
     }
 
     global.MasterOrderMenuImage = {
         DEFAULT_IMAGE_PUBLIC_BASE: DEFAULT_IMAGE_PUBLIC_BASE,
-        MENU_ICON_PREFIX: MENU_ICON_PREFIX,
+        MENU_CONVERTED_PREFIX: MENU_CONVERTED_PREFIX,
         imagePublicBase: imagePublicBase,
         normalizeImageKey: normalizeImageKey,
+        menuImageCandidateKeys: menuImageCandidateKeys,
         buildMenuImageUrl: buildMenuImageUrl,
         getIcon: getIcon,
         getMenuImageUrl: getMenuImageUrl,
-        buildMenuImageFallbackUrl: buildMenuImageFallbackUrl
+        buildMenuImageFallbackUrl: buildMenuImageFallbackUrl,
+        applyMenuImage: applyMenuImage
     };
 })(typeof window !== 'undefined' ? window : globalThis);
