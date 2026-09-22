@@ -8,8 +8,6 @@
 
     var DEFAULT_IMAGE_PUBLIC_BASE = 'https://masterorder-assets.mcservers-wp.com';
     var MENU_CONVERTED_PREFIX = 'menu/converted';
-    /** R2 再圧縮後に CDN HIT を避ける（Cache Purge 権限が無い環境向け）。 */
-    var MENU_IMAGE_CACHE_PIN = 'r800q72';
 
     function imagePublicBase() {
         var fromConfig = global.window && global.window._imageBaseUrl;
@@ -104,30 +102,57 @@
         return [MENU_CONVERTED_PREFIX + '/' + sid + '/' + file];
     }
 
-    function withMenuImageCachePin(url) {
+    function toThumbFileName(file) {
+        if (!file || /\.thumb\.[a-z0-9]+$/i.test(file)) {
+            return file;
+        }
+        return file.replace(/(\.[a-z0-9]+)$/i, '.thumb$1');
+    }
+
+    function toDetailFileName(file) {
+        if (!file) {
+            return file;
+        }
+        return file.replace(/\.thumb(\.[a-z0-9]+)$/i, '$1');
+    }
+
+    function wantsThumb(sizePrefix) {
+        var size = String(sizePrefix || '').toLowerCase();
+        return size === 'small' || size === 'thumb' || size === '256';
+    }
+
+    function wantsDetail(sizePrefix) {
+        var size = String(sizePrefix || '').toLowerCase();
+        return size === 'large' || size === 'detail' || size === '800';
+    }
+
+    /** パスだけ。版はファイル名の -v に置く。 */
+    function applyMenuImageSize(url, sizePrefix) {
         if (!url) {
-            return url;
+            return '';
         }
-        if (url.indexOf(MENU_CONVERTED_PREFIX + '/') < 0) {
-            return url;
+        var path = String(url).split('?')[0].split('#')[0];
+        var slash = path.lastIndexOf('/');
+        var file = slash >= 0 ? path.substring(slash + 1) : path;
+        var prefix = slash >= 0 ? path.substring(0, slash + 1) : '';
+        if (wantsThumb(sizePrefix)) {
+            file = toThumbFileName(file);
+        } else if (wantsDetail(sizePrefix)) {
+            file = toDetailFileName(file);
         }
-        if (url.indexOf('?') >= 0) {
-            return url + '&v=' + MENU_IMAGE_CACHE_PIN;
-        }
-        return url + '?v=' + MENU_IMAGE_CACHE_PIN;
+        return prefix + file;
     }
 
     function buildMenuImageUrl(imageUrl, sizePrefix) {
-        void sizePrefix;
         var candidates = menuImageCandidateKeys(imageUrl);
         if (!candidates.length) {
             return '';
         }
-        return withMenuImageCachePin(imagePublicBase() + '/' + candidates[0]);
+        return applyMenuImageSize(imagePublicBase() + '/' + candidates[0], sizePrefix);
     }
 
     function getIcon(uuid) {
-        return buildMenuImageUrl(uuid);
+        return buildMenuImageUrl(uuid, 'thumb');
     }
 
     function getMenuImageUrl(uuid, size) {
@@ -161,6 +186,7 @@
         DEFAULT_IMAGE_PUBLIC_BASE: DEFAULT_IMAGE_PUBLIC_BASE,
         MENU_CONVERTED_PREFIX: MENU_CONVERTED_PREFIX,
         imagePublicBase: imagePublicBase,
+        applyMenuImageSize: applyMenuImageSize,
         normalizeImageKey: normalizeImageKey,
         menuImageCandidateKeys: menuImageCandidateKeys,
         buildMenuImageUrl: buildMenuImageUrl,

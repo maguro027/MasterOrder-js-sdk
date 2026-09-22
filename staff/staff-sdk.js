@@ -387,6 +387,9 @@
             getMyProfile: getMyProfileWithCache,
             updateMyProfile: wrapProfileMutation(profileApi.updateMyProfile),
             setMyPublicId: wrapProfileMutation(profileApi.setMyPublicId),
+            checkPublicId: function (publicId) {
+                return profileApi.checkPublicId(publicId);
+            },
             saveProfile: wrapProfileMutation(profileApi.saveProfile),
             getMyAccountStatus: accountStateApi.getMyAccountStatus,
             reportPasswordResetCompleted: accountStateApi.reportPasswordResetCompleted,
@@ -712,6 +715,12 @@
                     method: 'POST',
                     body: form
                 });
+            },
+            getMenuImageJob: function (shopId, jobId) {
+                return http.request(
+                    '/shops/' + encodeURIComponent(shopId) + '/image-jobs/' + encodeURIComponent(jobId),
+                    { method: 'GET' }
+                );
             },
             deleteMenu: function (menuId) {
                 return http.delete(staffPaths.deleteMenu(menuId));
