@@ -384,6 +384,20 @@
         return /^https:\/\//i.test(value);
     }
 
+    /** 店舗が設定した外部リンク。javascript: や認証情報付き URL は開かない。 */
+    function isGuestExternalHttpsUrl(url) {
+        var value = String(url || '').trim();
+        if (!value || value.length > 2048) {
+            return false;
+        }
+        try {
+            var parsed = new URL(value);
+            return parsed.protocol === 'https:' && !!parsed.hostname && !parsed.username && !parsed.password;
+        } catch (_e) {
+            return false;
+        }
+    }
+
     var GUEST_SESSION_ID_RE = /^[ABEFGHJKMNPQRTUVWXYZabefghjkmnpqrtuvwxyz]{10}$/;
     /** Gate 初期実装が出した 16 hex（移行中の既存セッション用）。 */
     var GUEST_SESSION_ID_LEGACY_HEX_RE = /^[0-9a-fA-F]{16}$/;
@@ -1334,20 +1348,34 @@
         if (!bundle || typeof bundle !== 'object') {
             return bundle;
         }
-        var menus = Array.isArray(bundle.menus)
-            ? bundle.menus.map(function (menu) {
-                if (!menu || typeof menu !== 'object') {
-                    return menu;
+        var source = Array.isArray(bundle.menus) ? bundle.menus : [];
+        var changed = false;
+        var menus = new Array(source.length);
+        for (var i = 0; i < source.length; i++) {
+            var menu = source[i];
+            var next = menu;
+            if (menu && typeof menu === 'object') {
+                if (menu.isAvailable === false) {
+                    if (menu.stockQuantity != null || menu.soldOut !== true || menu.stockStatusLabel !== '提供停止') {
+                        next = Object.assign({}, menu);
+                        delete next.stockQuantity;
+                        next.soldOut = true;
+                        next.stockStatusLabel = '提供停止';
+                    }
+                } else if (menu.stockQuantity != null || menu.soldOut === true || menu.stockStatusLabel === '在庫切れ') {
+                    next = Object.assign({}, menu);
+                    delete next.stockQuantity;
+                    next.soldOut = false;
+                    next.stockStatusLabel = '在庫あり';
                 }
-                var copy = Object.assign({}, menu);
-                delete copy.stockQuantity;
-                copy.soldOut = false;
-                copy.stockStatusLabel = '在庫あり';
-                return copy;
-            })
-            : [];
+            }
+            if (next !== menu) {
+                changed = true;
+            }
+            menus[i] = next;
+        }
         return Object.assign({}, bundle, {
-            menus: menus,
+            menus: changed ? menus : source,
             // inventoryUpdatedAt はプローブ比較用に残す
             inventoryUpdatedAt: bundle.inventoryUpdatedAt != null
                 ? String(bundle.inventoryUpdatedAt)
@@ -1615,8 +1643,8 @@
                 return;
             }
             var type = String(tapAction.type || '').toUpperCase();
-            if (type === 'EXTERNAL' && tapAction.url) {
-                window.open(String(tapAction.url), '_blank', 'noopener,noreferrer');
+            if (type === 'EXTERNAL' && isGuestExternalHttpsUrl(tapAction.url)) {
+                window.open(String(tapAction.url).trim(), '_blank', 'noopener,noreferrer');
                 return;
             }
             if (type === 'CATEGORY' && tapAction.categoryName) {
@@ -2889,10 +2917,18 @@
             })
             : [];
         var soldOutIds = {};
+        var anySoldOut = false;
         for (var i = 0; i < menus.length; i++) {
             if (menus[i] && menus[i].soldOut && menus[i].id != null) {
                 soldOutIds[String(menus[i].id)] = true;
+                anySoldOut = true;
             }
+        }
+        if (!anySoldOut) {
+            return Object.assign({}, bundle, {
+                menus: menus,
+                inventoryUpdatedAt: inventoryUpdatedAt != null ? String(inventoryUpdatedAt) : null
+            });
         }
         var toppings = bundle.toppings && typeof bundle.toppings === 'object' ? bundle.toppings : {};
         var nextToppings = {};
@@ -4273,19 +4309,28 @@
         if (!hidden.length) {
             return list;
         }
-        var hiddenSet = {};
-        hidden.forEach(function (code) {
-            hiddenSet[code] = true;
-        });
         return list.filter(function (menu) {
-            var codes = guestMenuAllergyCodes(menu);
-            for (var i = 0; i < codes.length; i++) {
-                if (hiddenSet[codes[i]]) {
-                    return false;
+            return !guestMenuExcludedByHiddenAllergies(menu, hidden);
+        });
+    }
+
+    function guestMenuExcludedByHiddenAllergies(menu, hiddenAllergyCodes) {
+        if (!menu || typeof menu !== 'object') {
+            return false;
+        }
+        var hidden = Array.isArray(hiddenAllergyCodes) ? hiddenAllergyCodes : normalizeGuestHiddenAllergies(hiddenAllergyCodes);
+        if (!hidden.length) {
+            return false;
+        }
+        var codes = guestMenuAllergyCodes(menu);
+        for (var i = 0; i < codes.length; i++) {
+            for (var h = 0; h < hidden.length; h++) {
+                if (codes[i] === hidden[h]) {
+                    return true;
                 }
             }
-            return true;
-        });
+        }
+        return false;
     }
 
     /**
@@ -5412,6 +5457,7 @@
             guestMenuLanguageLabel: guestMenuLanguageLabel,
             shouldPromptGuestMenuLanguage: shouldPromptGuestMenuLanguage,
             filterGuestMenusByAllergies: filterGuestMenusByAllergies,
+            guestMenuExcludedByHiddenAllergies: guestMenuExcludedByHiddenAllergies,
             getGuestHiddenAllergies: getGuestHiddenAllergies,
             setGuestHiddenAllergies: setGuestHiddenAllergies,
             guestAllergyLabel: guestAllergyLabel,
@@ -5557,6 +5603,7 @@
             sdk.getMyProfile = profileApi.getMyProfile;
             sdk.updateMyProfile = profileApi.updateMyProfile;
             sdk.setMyPublicId = profileApi.setMyPublicId;
+            sdk.checkPublicId = profileApi.checkPublicId;
             sdk.saveProfile = profileApi.saveProfile;
         }
 
@@ -7422,6 +7469,7 @@
         guestMenuSaleCategoryLabel: guestMenuSaleCategoryLabel,
         filterGuestMenusByCategory: filterGuestMenusByCategory,
         filterGuestMenusByAllergies: filterGuestMenusByAllergies,
+        guestMenuExcludedByHiddenAllergies: guestMenuExcludedByHiddenAllergies,
         getGuestHiddenAllergies: getGuestHiddenAllergies,
         setGuestHiddenAllergies: setGuestHiddenAllergies,
         guestAllergyLabel: guestAllergyLabel,
