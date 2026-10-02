@@ -2873,9 +2873,15 @@
                 if (!menu || typeof menu !== 'object') {
                     return menu;
                 }
+                if (menu.isAvailable === false) {
+                    return Object.assign({}, menu, {
+                        soldOut: true,
+                        stockStatusLabel: '提供停止'
+                    });
+                }
                 var stock = stockMap[menu.id];
                 var stockQuantity = typeof stock === 'number' && isFinite(stock) ? Math.max(0, stock) : 0;
-                var soldOut = menu.isAvailable === false || stockQuantity <= 0;
+                var soldOut = stockQuantity <= 0;
                 return Object.assign({}, menu, {
                     soldOut: soldOut,
                     stockStatusLabel: soldOut ? '在庫切れ' : '在庫あり'
@@ -3704,9 +3710,9 @@
         if (!pricingApi || typeof pricingApi.enrichGuestMenuForDisplay !== 'function') {
             normalized.price = resolveGuestMenuDisplayPrice(normalized);
         }
-        if (normalized.isAvailable === false) {
+        if (normalized.isAvailable === false || normalized.stockStatusLabel === '提供停止') {
             normalized.soldOut = true;
-            normalized.stockStatusLabel = '在庫切れ';
+            normalized.stockStatusLabel = '提供停止';
             return normalized;
         }
         var stock = Number(normalized.stockQuantity);
