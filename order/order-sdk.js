@@ -1088,6 +1088,8 @@
     }
 
     var GUEST_PUBLIC_SHOP_CACHE_PREFIX = 'mo_guest_public_shop:';
+    /** 非表示設定は bundle の generation を変えない。短い TTL で取り直す。 */
+    var GUEST_PUBLIC_SHOP_CACHE_TTL_MS = 8 * 1000;
     var GUEST_ORDER_BUNDLE_CACHE_PREFIX = 'mo_guest_order_bundle:v4:';
     var GUEST_ORDER_BUNDLE_CACHE_PREFIX_LEGACY = 'mo_guest_order_bundle:';
     /** generation 不一致で破棄するので長 TTL 可。CDN 365日方針に合わせる。 */
@@ -1489,7 +1491,34 @@
         }
         var allowVpsFallback = !!(options && options.allowVpsFallback === true);
         var cacheKey = GUEST_PUBLIC_SHOP_CACHE_PREFIX + slug;
-        var cached = readGuestSessionJsonCache(cacheKey);
+        var cached = readGuestSessionJsonCache(cacheKey, GUEST_PUBLIC_SHOP_CACHE_TTL_MS);
+        var onShopRefresh = options && typeof options.onShopRefresh === 'function'
+            ? options.onShopRefresh
+            : null;
+
+        function guestShopDisplaySignature(shop) {
+            if (!shop || typeof shop !== 'object') {
+                return '';
+            }
+            return [
+                shop.hideSoldOutMenus === true ? '1' : '0',
+                shop.hideSalesStoppedMenus === true ? '1' : '0',
+                shop.bannerUrl ? String(shop.bannerUrl) : '',
+                shop.updatedAt != null ? String(shop.updatedAt) : ''
+            ].join('|');
+        }
+
+        function notifyShopRefresh(previous, shop) {
+            if (!onShopRefresh || !shop) {
+                return;
+            }
+            if (previous && guestShopDisplaySignature(previous) === guestShopDisplaySignature(shop)) {
+                return;
+            }
+            try {
+                onShopRefresh(shop);
+            } catch (_ignored) { /* UI hook */ }
+        }
         var gateHttp = core.createHttpClient({ baseUrl: inferGuestCatalogReadBase() });
         var serverBase = (apiBase || inferGuestApiBase()).replace(/\/$/, '');
         var serverHttp = core.createHttpClient({ baseUrl: serverBase });
@@ -1593,7 +1622,11 @@
 
         if (cached && cached.payload && cached.payload.shopId) {
             if (!inflightGuestPublicShop[slug]) {
-                trackPublicShopInflight(fetchPublicShopFromGate());
+                var previous = cached.payload;
+                trackPublicShopInflight(fetchPublicShopFromGate().then(function (shop) {
+                    notifyShopRefresh(previous, shop);
+                    return shop;
+                }));
             }
             return Promise.resolve(cached.payload);
         }
@@ -3358,6 +3391,10 @@
         });
     }
 
+    function isGuestMenuSalesStopped(menu) {
+        return !!(menu && menu.isAvailable === false);
+    }
+
     function isGuestMenuSoldOut(menu) {
         if (!menu || typeof menu !== 'object') {
             return true;
@@ -3681,12 +3718,36 @@
         return !!(err && err.code === 'SALE_ENDED');
     }
 
+    function isGuestOrderMenuUnavailableError(err) {
+        err = enrichGuestOrderApiError(err);
+        if (!err) {
+            return false;
+        }
+        if (err.code === 'MENU_UNAVAILABLE') {
+            return true;
+        }
+        var payload = err.payload;
+        if (payload && typeof payload === 'object' && payload.code === 'MENU_UNAVAILABLE') {
+            return true;
+        }
+        var msg = String(
+            err.errorMessage
+            || err.message
+            || (payload && (payload.errorMessage || payload.message))
+            || ''
+        );
+        return msg.indexOf('現在注文できません') >= 0;
+    }
+
     function isGuestOrderStockError(err) {
         err = enrichGuestOrderApiError(err);
         if (!err) {
             return false;
         }
         var code = String(err.code || '');
+        if (code === 'MENU_UNAVAILABLE') {
+            return false;
+        }
         if (code === 'OUT_OF_STOCK' || code === 'INSUFFICIENT_STOCK' || code === 'STOCK_UNAVAILABLE') {
             return true;
         }
@@ -4348,7 +4409,6 @@
             };
         }
         options = options || {};
-        options = Object.assign({}, options, { refreshOnVisibilityOnly: true });
         return api.createGuestMenuPricingRefreshScheduler(options);
     }
 
@@ -5543,8 +5603,10 @@
             prepareGuestCartForOrderSubmit: prepareGuestCartForOrderSubmit,
             isGuestOrderPriceStaleError: isGuestOrderPriceStaleError,
             isGuestOrderSaleEndedError: isGuestOrderSaleEndedError,
+            isGuestOrderMenuUnavailableError: isGuestOrderMenuUnavailableError,
             isGuestOrderStockError: isGuestOrderStockError,
             formatGuestOrderStockErrorMessage: formatGuestOrderStockErrorMessage,
+            isGuestMenuSalesStopped: isGuestMenuSalesStopped,
             isGuestMenuSoldOut: isGuestMenuSoldOut,
             filterGuestMenusHideSoldOut: filterGuestMenusHideSoldOut,
             stripGuestInventoryForBrowse: stripGuestInventoryForBrowse,
@@ -7493,6 +7555,7 @@
         resolveDisplayFamilyName: core.resolveDisplayFamilyName,
         normalizeUserProfile: core.normalizeUserProfile,
         normalizeGuestMenu: normalizeGuestMenu,
+        isGuestMenuSalesStopped: isGuestMenuSalesStopped,
         isGuestMenuSoldOut: isGuestMenuSoldOut,
         filterGuestMenusHideSoldOut: filterGuestMenusHideSoldOut,
         stripGuestInventoryForBrowse: stripGuestInventoryForBrowse,
@@ -7516,6 +7579,7 @@
         prepareGuestCartForOrderSubmit: prepareGuestCartForOrderSubmit,
         isGuestOrderPriceStaleError: isGuestOrderPriceStaleError,
         isGuestOrderSaleEndedError: isGuestOrderSaleEndedError,
+        isGuestOrderMenuUnavailableError: isGuestOrderMenuUnavailableError,
         isGuestOrderStockError: isGuestOrderStockError,
         formatGuestOrderStockErrorMessage: formatGuestOrderStockErrorMessage,
         formatGuestConnectError: formatGuestConnectError,
