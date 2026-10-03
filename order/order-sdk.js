@@ -1223,6 +1223,8 @@
                 String(menu.id) + ':'
                 + (menu.soldOut === true ? '0' : '1') + ':'
                 + (menu.stockQuantity != null ? String(menu.stockQuantity) : '')
+                + ':'
+                + (menu.isAvailable === false ? '0' : '1')
             );
         }
         parts.sort();
@@ -3727,7 +3729,9 @@
             return true;
         }
         var payload = err.payload;
-        if (payload && typeof payload === 'object' && payload.code === 'MENU_UNAVAILABLE') {
+        if (payload && typeof payload === 'object' && (
+            payload.code === 'MENU_UNAVAILABLE' || payload.reasonCode === 'MENU_UNAVAILABLE'
+        )) {
             return true;
         }
         var msg = String(
