@@ -3720,6 +3720,35 @@
         return !!(err && err.code === 'SALE_ENDED');
     }
 
+    function guestOrderRejectedMenuIds(err) {
+        err = enrichGuestOrderApiError(err);
+        var payload = err && err.payload;
+        var ids = [];
+        var seen = Object.create(null);
+        function add(list) {
+            if (!Array.isArray(list)) {
+                return;
+            }
+            list.forEach(function (id) {
+                var key = String(id || '').trim();
+                if (!key || seen[key.toLowerCase()]) {
+                    return;
+                }
+                seen[key.toLowerCase()] = true;
+                ids.push(key);
+            });
+        }
+        if (payload && typeof payload === 'object') {
+            add(payload.unavailableMenuIds);
+            add(payload.outOfStockMenuIds);
+            if (payload.data && typeof payload.data === 'object') {
+                add(payload.data.unavailableMenuIds);
+                add(payload.data.outOfStockMenuIds);
+            }
+        }
+        return ids;
+    }
+
     function isGuestOrderMenuUnavailableError(err) {
         err = enrichGuestOrderApiError(err);
         if (!err) {
@@ -5607,6 +5636,7 @@
             prepareGuestCartForOrderSubmit: prepareGuestCartForOrderSubmit,
             isGuestOrderPriceStaleError: isGuestOrderPriceStaleError,
             isGuestOrderSaleEndedError: isGuestOrderSaleEndedError,
+            guestOrderRejectedMenuIds: guestOrderRejectedMenuIds,
             isGuestOrderMenuUnavailableError: isGuestOrderMenuUnavailableError,
             isGuestOrderStockError: isGuestOrderStockError,
             formatGuestOrderStockErrorMessage: formatGuestOrderStockErrorMessage,
@@ -7583,6 +7613,7 @@
         prepareGuestCartForOrderSubmit: prepareGuestCartForOrderSubmit,
         isGuestOrderPriceStaleError: isGuestOrderPriceStaleError,
         isGuestOrderSaleEndedError: isGuestOrderSaleEndedError,
+        guestOrderRejectedMenuIds: guestOrderRejectedMenuIds,
         isGuestOrderMenuUnavailableError: isGuestOrderMenuUnavailableError,
         isGuestOrderStockError: isGuestOrderStockError,
         formatGuestOrderStockErrorMessage: formatGuestOrderStockErrorMessage,
