@@ -54,22 +54,31 @@
         return RATE_10;
     }
 
+    function ratePercent(rate) {
+        var percent = Math.floor((Number(rate) || 0) * 100);
+        return percent > 0 ? percent : 0;
+    }
+
     function deriveBaseFromTaxInclusive(taxInclusivePrice, taxCategory, referenceSessionType, customTaxRatePercent) {
-        var price = Number(taxInclusivePrice) || 0;
+        var price = Math.round(Number(taxInclusivePrice) || 0);
         if (price <= 0) {
             return 0;
         }
-        var rate = resolveEffectiveRate(taxCategory, referenceSessionType, customTaxRatePercent);
-        return Math.round(price / (1 + rate));
+        var percent = ratePercent(resolveEffectiveRate(taxCategory, referenceSessionType, customTaxRatePercent));
+        if (percent <= 0) {
+            return price;
+        }
+        var tax = Math.floor(price * percent / (100 + percent));
+        return price - tax;
     }
 
     function deriveTaxInclusiveFromBase(basePrice, taxCategory, sessionType, customTaxRatePercent) {
-        var base = Number(basePrice) || 0;
+        var base = Math.round(Number(basePrice) || 0);
         if (base <= 0) {
             return 0;
         }
-        var rate = resolveEffectiveRate(taxCategory, sessionType, customTaxRatePercent);
-        return Math.round(base * (1 + rate));
+        var percent = ratePercent(resolveEffectiveRate(taxCategory, sessionType, customTaxRatePercent));
+        return base + Math.floor(base * percent / 100);
     }
 
     function migrateLegacyTaxInclusivePrice(legacyPrice) {

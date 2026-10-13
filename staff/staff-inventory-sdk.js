@@ -1,5 +1,5 @@
 /**
- * スタッフ商品詳細 — 手動在庫編集（1分クールダウンは SDK + サーバー双方で防御）。
+ * スタッフ商品詳細 — 手動在庫編集（1分に6回、超えたら1分停止。SDK + サーバー双方で防御）。
  *
  * 依存: api-routes.js
  * グローバル: MasterOrderStaffInventorySdk
@@ -8,6 +8,9 @@
     'use strict';
 
     var COOLDOWN_MS = 60 * 1000;
+    var WINDOW_MS = 60 * 1000;
+    var MAX_PER_WINDOW = 6;
+    var HITS_PREFIX = 'masterorder.staffInventoryHits.';
     var LIST_RESET_COOLDOWN_MS = 30 * 60 * 1000;
     var STORAGE_PREFIX = 'masterorder.staffInventoryCooldown.';
     var LIST_RESET_STORAGE_PREFIX = 'masterorder.staffInventoryListResetCooldown.';
@@ -59,6 +62,37 @@
 
     function markCooldown(menuId) {
         writeCooldownUntil(menuId, Date.now() + COOLDOWN_MS);
+    }
+
+    function readHits(menuId) {
+        if (!menuId) {
+            return [];
+        }
+        try {
+            var raw = global.localStorage.getItem(HITS_PREFIX + menuId);
+            var parsed = raw ? JSON.parse(raw) : [];
+            return Array.isArray(parsed) ? parsed : [];
+        } catch (_ignored) {
+            return [];
+        }
+    }
+
+    function recordSuccessfulUpdate(menuId) {
+        var now = Date.now();
+        var hits = readHits(menuId).filter(function (ts) {
+            return now - Number(ts) < WINDOW_MS;
+        });
+        hits.push(now);
+        if (hits.length >= MAX_PER_WINDOW) {
+            writeCooldownUntil(menuId, now + COOLDOWN_MS);
+            try {
+                global.localStorage.removeItem(HITS_PREFIX + menuId);
+            } catch (_ignored) { /* ignore */ }
+            return;
+        }
+        try {
+            global.localStorage.setItem(HITS_PREFIX + menuId, JSON.stringify(hits));
+        } catch (_ignored) { /* ignore */ }
     }
 
     function listResetCooldownKey(shopId) {
@@ -305,7 +339,7 @@
             };
             return Promise.resolve(opts.applyUpdate(menuId, payload))
                 .then(function (result) {
-                    markCooldown(menuId);
+                    recordSuccessfulUpdate(menuId);
                     // 保存直後はペイロードを正とする。サーバーが別 TX で古い initialQuantity を返すレースを吸収する。
                     draft.menu.initialQuantity = clampStock(payload.initialQuantity);
                     draft.initialQuantity = draft.menu.initialQuantity;

@@ -136,7 +136,7 @@
             payload.subCategoryIds,
             payload.categoryIds
         );
-        return {
+        var normalized = {
             localized: normalizeLocalized(payload.localized),
             price: normalizePrice(payload.price),
             taxCategory: normalizeTaxCategory(payload.taxCategory),
@@ -153,6 +153,19 @@
             promotions: Array.isArray(payload.promotions) ? payload.promotions : undefined,
             clearPromotions: payload.clearPromotions === true ? true : undefined
         };
+        if (Object.prototype.hasOwnProperty.call(payload, 'isPublic')) {
+            normalized.isPublic = payload.isPublic !== false;
+        }
+        if (Object.prototype.hasOwnProperty.call(payload, 'isAvailable')) {
+            normalized.isAvailable = payload.isAvailable !== false;
+        }
+        if (Object.prototype.hasOwnProperty.call(payload, 'publishFrom')) {
+            normalized.publishFrom = trimOrNull(payload.publishFrom);
+        }
+        if (Object.prototype.hasOwnProperty.call(payload, 'publishTo')) {
+            normalized.publishTo = trimOrNull(payload.publishTo);
+        }
+        return normalized;
     }
 
     function buildMenuUpdateBaseline(menu) {
@@ -182,7 +195,11 @@
             subCategoryIds: deriveSubCategoryIds(menu),
             categoryIds: menu.categoryIds,
             staffMemo: menu.staffMemo,
-            promotions: Array.isArray(menu.promotions) ? menu.promotions : undefined
+            promotions: Array.isArray(menu.promotions) ? menu.promotions : undefined,
+            isPublic: menu.isPublic !== false && menu.public !== false,
+            isAvailable: menu.isAvailable !== false && menu.available !== false,
+            publishFrom: menu.publishFrom || null,
+            publishTo: menu.publishTo || null
         });
     }
 

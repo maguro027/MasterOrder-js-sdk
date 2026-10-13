@@ -75,6 +75,58 @@
     var authPaths = apiRouteRegistry.paths.auth || staffPaths;
     var menuMutation = global.MasterOrderStaffMenuMutation;
 
+    var gateStaffPaths = apiRouteRegistry.paths.gateStaff || null;
+    var PRODUCTION_API_HOST = 'masterorder-api.mcservers-wp.com';
+    var PRODUCTION_GATE_BASE = 'https://masterorder-gate.mcservers-wp.com';
+    /** Gate WebSocket が開かなかったら、この間は VPS SSE を使う */
+    var GATE_EVENTS_FALLBACK_MS = 10 * 60 * 1000;
+
+    /** スタッフ通知を Gate で受けるときの Gate URL。使わないときは null。 */
+    function staffRealtimeGateBase(apiBaseUrl) {
+        if (!gateStaffPaths || typeof WebSocket === 'undefined') {
+            return null;
+        }
+        if (typeof window !== 'undefined' && window._staffRealtimeViaGate === false) {
+            return null;
+        }
+        if (typeof window !== 'undefined' && typeof window._gatePublicBase === 'string' && window._gatePublicBase.trim()) {
+            return window._gatePublicBase.trim().replace(/\/$/, '');
+        }
+        try {
+            if (new URL(apiBaseUrl).hostname === PRODUCTION_API_HOST) {
+                return PRODUCTION_GATE_BASE;
+            }
+        } catch (_) { /* relative or invalid base */ }
+        return null;
+    }
+
+    function issueGateEventsTicket(gateBase, getIdToken, shopId) {
+        return Promise.resolve(typeof getIdToken === 'function' ? getIdToken() : null).then(function (token) {
+            if (!token) {
+                throw new Error('staff events: no token');
+            }
+            return fetch(core.withQuery(gateBase + gateStaffPaths.eventsTicket(), { shopId: shopId }), {
+                method: 'POST',
+                headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+                body: '{}',
+                credentials: 'omit'
+            });
+        }).then(function (res) {
+            if (!res.ok) {
+                throw new Error('staff events ticket ' + res.status);
+            }
+            return res.json();
+        }).then(function (body) {
+            if (!body || !body.ticket) {
+                throw new Error('staff events ticket missing');
+            }
+            var wsUrl = new URL(gateBase + gateStaffPaths.eventsSocket());
+            wsUrl.protocol = wsUrl.protocol === 'http:' ? 'ws:' : 'wss:';
+            wsUrl.searchParams.set('ticket', body.ticket);
+            return wsUrl.toString();
+        });
+    }
+
     function issueSseTicket(http, shopId) {
         return http.post(core.withQuery(staffPaths.orderEventsTicket(), { shopId: shopId }), undefined)
             .then(function (body) {
@@ -106,6 +158,106 @@
             reconnectDelayMs: options.sseReconnectDelayMs || 5000,
             minReconnectGapMs: options.sseMinReconnectGapMs || 15000
         });
+        var gateEvents = typeof core.createWebSocketEventsClient === 'function'
+            ? core.createWebSocketEventsClient({
+                reconnectDelayMs: options.sseReconnectDelayMs || 5000,
+                minReconnectGapMs: options.sseMinReconnectGapMs || 15000
+            })
+            : null;
+        var gateEventsFallbackUntil = 0;
+
+        function connectOrderEventsViaServer(shopId, onMessage, h) {
+            return sse.connectAsync({
+                url: apiBaseUrl + staffPaths.orderEventsSse(),
+                query: { shopId: shopId },
+                fetchTicket: function () {
+                    return issueSseTicket(http, shopId);
+                },
+                eventName: 'order-update',
+                onMessage: onMessage,
+                onOpen: h.onOpen,
+                onError: h.onError
+            });
+        }
+
+        /**
+         * 呼び出し側は返したハンドルを接続済みとみなして張り直さない。開く前に落ちたら（CSP 拒否など）
+         * ここで SSE に切り替え、同じハンドルから SSE 側を操作できるようにする。
+         */
+        function connectOrderEventsViaGate(gateBase, shopId, onMessage, h) {
+            var opened = false;
+            var closed = false;
+            var serverHandle = null;
+            var gateHandle = null;
+            function fallBackToServer(reason) {
+                gateEventsFallbackUntil = Date.now() + GATE_EVENTS_FALLBACK_MS;
+                gateEvents.close();
+                console.warn('[MasterOrderStaffSdk] Gate staff events closed before open; using server SSE', reason);
+                connectOrderEventsViaServer(shopId, onMessage, h).then(function (handle) {
+                    serverHandle = handle;
+                    if (closed) {
+                        sse.close();
+                    }
+                }).catch(function (err) {
+                    if (h.onError) {
+                        h.onError(err);
+                    }
+                });
+            }
+            function active() {
+                return serverHandle || gateHandle;
+            }
+            function call(name, fallbackValue) {
+                var target = active();
+                return target && typeof target[name] === 'function' ? target[name]() : fallbackValue;
+            }
+            return gateEvents.connectAsync({
+                fetchUrl: function () {
+                    return issueGateEventsTicket(gateBase, options.getIdToken, shopId);
+                },
+                onMessage: onMessage,
+                onOpen: function (event) {
+                    opened = true;
+                    if (h.onOpen) {
+                        h.onOpen(event);
+                    }
+                },
+                onError: function (event) {
+                    if (!opened) {
+                        if (!closed && !serverHandle) {
+                            fallBackToServer(event && event.code != null ? 'code ' + event.code : event);
+                        }
+                        return;
+                    }
+                    if (h.onError) {
+                        h.onError(event);
+                    }
+                }
+            }).then(function (handle) {
+                gateHandle = handle;
+                return {
+                    close: function () {
+                        closed = true;
+                        if (serverHandle) {
+                            sse.close();
+                        }
+                        gateEvents.close();
+                    },
+                    getReadyState: function () {
+                        return call('getReadyState', 2);
+                    },
+                    getLastActivityAt: function () {
+                        return call('getLastActivityAt', 0);
+                    },
+                    getLastNamedEventAt: function () {
+                        return call('getLastNamedEventAt', 0);
+                    },
+                    forceReconnect: function () {
+                        return call('forceReconnect', undefined);
+                    }
+                };
+            });
+        }
 
         var profileApi = core.createProfileApi(http, authPaths);
         var accountStateApi = core.createAccountStateApi(http, authPaths);
@@ -144,7 +296,7 @@
             ]).then(function (pair) {
                 var menus = Array.isArray(pair[0]) ? pair[0] : [];
                 var subscribe = pair[1];
-                if (shopIsFree(subscribe)) {
+                if (!subscribe || shopIsFree(subscribe)) {
                     return { menus: menus, subscribe: subscribe };
                 }
                 return http.get(staffPaths.shopInventory(shopId)).catch(function () { return []; })
@@ -222,7 +374,10 @@
                 ? http.get(core.withQuery(path, query))
                 : http.get(path);
             var p = req.then(function (value) {
-                myShopsCache[key] = { at: Date.now(), value: value };
+                // 空配列はログイン直後の取りこぼしとゼロ件の区別がつかない。キャッシュすると F5 まで空のままになる。
+                if (!Array.isArray(value) || value.length > 0) {
+                    myShopsCache[key] = { at: Date.now(), value: value };
+                }
                 delete myShopsInflight[key];
                 return value;
             }, function (err) {
@@ -231,6 +386,14 @@
             });
             myShopsInflight[key] = p;
             return p;
+        }
+
+        function profileKnowsShopCreate(profile) {
+            if (!profile || typeof profile !== 'object') {
+                return false;
+            }
+            var type = String(profile.accountType || '').trim().toUpperCase();
+            return type === 'STAFF' || type === 'OWNER' || type === 'ADMIN';
         }
 
         function getMyProfileWithCache(callOptions) {
@@ -270,7 +433,7 @@
                     clearCachedIdentity(uid);
                     return Promise.reject(new Error('auth token not ready'));
                 }
-                return profileApi.getMyProfile()
+                return profileApi.getMyProfile(opts)
                     .then(cacheProfile)
                     .catch(function (err) {
                         if (isAuthorizationFailure(err)) {
@@ -292,6 +455,10 @@
                     inflightProfileUid = null;
                 }
             });
+            if (staleCached && !profileKnowsShopCreate(staleCached)) {
+                // 店舗作成の種別が無いキャッシュは、課金案内を誤って出すので使わない。
+                staleCached = null;
+            }
             if (staleCached) {
                 // キャッシュで即返し、裏で最新を取りに行く
                 void inflightProfilePromise.catch(function () { /* swr background */ });
@@ -384,6 +551,18 @@
                     return created;
                 });
             },
+            createOwnerCheckout: function () {
+                return http.post(staffPaths.ownerCheckout(), {});
+            },
+            confirmOwnerCheckout: function (sessionId) {
+                return http.post(staffPaths.confirmOwnerCheckout(), { sessionId: sessionId });
+            },
+            createShopSlotCheckout: function () {
+                return http.post(staffPaths.shopSlotCheckout(), {});
+            },
+            confirmShopSlotCheckout: function (sessionId) {
+                return http.post(staffPaths.confirmShopSlotCheckout(), { sessionId: sessionId });
+            },
             getMyProfile: getMyProfileWithCache,
             updateMyProfile: wrapProfileMutation(profileApi.updateMyProfile),
             setMyPublicId: wrapProfileMutation(profileApi.setMyPublicId),
@@ -391,6 +570,9 @@
                 return profileApi.checkPublicId(publicId);
             },
             saveProfile: wrapProfileMutation(profileApi.saveProfile),
+            redeemPromotion: function (code) {
+                return profileApi.redeemPromotion(code);
+            },
             getMyAccountStatus: accountStateApi.getMyAccountStatus,
             reportPasswordResetCompleted: accountStateApi.reportPasswordResetCompleted,
             syncFirebaseClaims: function () {
@@ -408,7 +590,16 @@
                 if (bounds.to != null && String(bounds.to).trim() !== '') {
                     query.to = String(bounds.to).trim();
                 }
+                if (bounds.includeHourly === true) {
+                    query.includeHourly = 'true';
+                }
                 return http.get(core.withQuery(staffPaths.shopDashboard(shopId), query));
+            },
+            getShopToday: function (shopId) {
+                return http.get(staffPaths.shopDashboardToday(shopId));
+            },
+            downloadShopSalesCsv: function (shopId, query) {
+                return http.get(core.withQuery(staffPaths.shopDashboardExport(shopId), query || {}));
             },
             getShopDashboardMonths: function (shopId) {
                 return http.get(staffPaths.shopDashboardMonths(shopId));
@@ -500,6 +691,9 @@
             checkoutSession: function (sessionId, body) {
                 return http.post(staffPaths.checkoutSession(sessionId), body || {});
             },
+            getCheckoutScriptPreview: function (sessionId) {
+                return http.get(staffPaths.checkoutScriptPreview(sessionId));
+            },
             ackStaffRequest: function (sessionId) {
                 return http.post(staffPaths.ackStaffRequest(sessionId), {});
             },
@@ -537,6 +731,9 @@
                 return http.get(core.withQuery(staffPaths.sessionDetail(sessionId), query))
                     .then(core.normalizeSessionDetailResponse);
             },
+            getSessionGuestLink: function (sessionId) {
+                return http.get(staffPaths.sessionGuestLink(sessionId));
+            },
             getPendingOrders: function (shopId) {
                 return http.get(core.withQuery(staffPaths.pendingOrders(), { shopId: shopId }))
                     .then(core.normalizePendingOrdersResponse);
@@ -545,9 +742,24 @@
                 var opts = options || {};
                 return http.get(core.withQuery(staffPaths.archiveSessions(), Object.assign({ shopId: shopId }, opts)));
             },
-            getArchivedSessionDetail: function (sessionId) {
-                return http.get(staffPaths.archiveSessionDetail(sessionId))
+            getArchivedSessionDetail: function (sessionId, options) {
+                var opts = options || {};
+                var query = {};
+                if (opts.shopId != null && String(opts.shopId).trim() !== '') {
+                    query.shopId = opts.shopId;
+                }
+                return http.get(core.withQuery(staffPaths.archiveSessionDetail(sessionId), query))
                     .then(core.normalizeSessionDetailResponse);
+            },
+            updateFormalReceipt: function (sessionId, fields) {
+                var body = fields || {};
+                return http.request(staffPaths.archiveFormalReceipt(sessionId), {
+                    method: 'PATCH',
+                    body: JSON.stringify({
+                        addressee: body.addressee != null ? String(body.addressee) : '',
+                        proviso: body.proviso != null ? String(body.proviso) : ''
+                    })
+                });
             },
             updateSessionMemo: function (sessionId, memo) {
                 return http.request(staffPaths.sessionMemo(sessionId), {
@@ -609,26 +821,34 @@
                     })
                 });
             },
+            /** Gate WebSocket を優先し、開けなければ VPS SSE。ハンドルはどちらも同じ形。 */
             connectShopOrderEvents: function (shopId, realtimeHandler, handlers) {
                 var h = handlers || {};
-                return sse.connectAsync({
-                    url: apiBaseUrl + staffPaths.orderEventsSse(),
-                    query: { shopId: shopId },
-                    fetchTicket: function () {
-                        return issueSseTicket(http, shopId);
-                    },
-                    eventName: 'order-update',
-                    onMessage: wrapSseHandler(function (event) {
-                        if (typeof realtimeHandler === 'function') {
-                            void realtimeHandler(event);
-                        }
-                    }),
-                    onOpen: h.onOpen,
-                    onError: h.onError
+                var onMessage = wrapSseHandler(function (event) {
+                    if (typeof realtimeHandler === 'function') {
+                        void realtimeHandler(event);
+                    }
                 });
+                var gateBase = gateEvents ? staffRealtimeGateBase(apiBaseUrl) : null;
+                if (gateBase && Date.now() >= gateEventsFallbackUntil) {
+                    sse.close();
+                    return connectOrderEventsViaGate(gateBase, shopId, onMessage, h).catch(function (err) {
+                        console.warn('[MasterOrderStaffSdk] Gate staff events unavailable; using server SSE', err);
+                        gateEventsFallbackUntil = Date.now() + GATE_EVENTS_FALLBACK_MS;
+                        gateEvents.close();
+                        return connectOrderEventsViaServer(shopId, onMessage, h);
+                    });
+                }
+                if (gateEvents) {
+                    gateEvents.close();
+                }
+                return connectOrderEventsViaServer(shopId, onMessage, h);
             },
             closeOrderEvents: function () {
                 sse.close();
+                if (gateEvents) {
+                    gateEvents.close();
+                }
             },
             getMyPermissions: function (shopId) {
                 return http.get(staffPaths.permissionsMe(shopId));
@@ -685,6 +905,20 @@
             },
             createMenu: function (shopId, payload) {
                 return http.post(staffPaths.createMenu(shopId), payload);
+            },
+            listMenuDrafts: function (shopId) {
+                return http.get(staffPaths.listMenuDrafts(shopId));
+            },
+            saveMenuDraft: function (shopId, draftId, payload) {
+                return http.request(staffPaths.saveMenuDraft(shopId, draftId), {
+                    method: 'PUT',
+                    body: JSON.stringify(payload || {})
+                });
+            },
+            deleteMenuDraft: function (shopId, draftId) {
+                return http.request(staffPaths.deleteMenuDraft(shopId, draftId), {
+                    method: 'DELETE'
+                });
             },
             buildMenuUpdateBaseline: function (menu) {
                 return menuMutation ? menuMutation.buildMenuUpdateBaseline(menu) : null;
@@ -1026,9 +1260,34 @@
         var getShopId = options.getShopId;
         var debounceMs = options.debounceMs != null ? options.debounceMs : 500;
         var lastSignature = '';
+        var knownOrderIds = null;
         var debounceTimer = null;
         var inFlight = false;
         var pendingReloadOpts = null;
+
+        function pendingOrderId(order) {
+            if (!order) {
+                return '';
+            }
+            if (order.orderId != null && order.orderId !== '') {
+                return String(order.orderId);
+            }
+            if (order.id != null && order.id !== '') {
+                return String(order.id);
+            }
+            return '';
+        }
+
+        function pendingOrderIdSet(list) {
+            var set = new Set();
+            (Array.isArray(list) ? list : []).forEach(function (order) {
+                var id = pendingOrderId(order);
+                if (id) {
+                    set.add(id);
+                }
+            });
+            return set;
+        }
 
         function load(loadOpts) {
             var opts = loadOpts || {};
@@ -1051,9 +1310,17 @@
                 .then(function (orders) {
                     var list = Array.isArray(orders) ? orders : [];
                     var signature = core.buildPendingOrdersSignature(list);
-                    if (lastSignature && signature && signature !== lastSignature && options.onNewOrders) {
-                        options.onNewOrders(list);
+                    var currentIds = pendingOrderIdSet(list);
+                    if (knownOrderIds != null && signature && signature !== lastSignature && options.onNewOrders) {
+                        var fresh = list.filter(function (order) {
+                            var id = pendingOrderId(order);
+                            return id && !knownOrderIds.has(id);
+                        });
+                        if (fresh.length) {
+                            options.onNewOrders(fresh);
+                        }
                     }
+                    knownOrderIds = currentIds;
                     if (opts.silent && !opts.forceRender && signature && signature === lastSignature) {
                         return list;
                     }
@@ -1096,6 +1363,7 @@
             scheduleLoad: scheduleLoad,
             resetSignature: function () {
                 lastSignature = '';
+                knownOrderIds = null;
             },
             getLastSignature: function () {
                 return lastSignature;

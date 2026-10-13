@@ -201,8 +201,262 @@
         return name || 'クーポン';
     }
 
+    function formatCouponYen(item) {
+        var raw = item && item.lineTotal != null
+            ? Number(item.lineTotal)
+            : Number(item && item.unitPrice);
+        if (!Number.isFinite(raw)) {
+            raw = 0;
+        }
+        if (raw > 0) {
+            raw = -raw;
+        }
+        return formatYen(raw);
+    }
+
+    /**
+     * 円の整数だけを返す。小数・非数・安全整数外はまとめない（null）。
+     */
+    function receiptIntegerYen(value) {
+        if (value == null || value === '') {
+            return null;
+        }
+        var n = Number(value);
+        if (!Number.isSafeInteger(n)) {
+            return null;
+        }
+        return n;
+    }
+
+    function receiptFiniteYen(value) {
+        if (value == null || value === '') {
+            return null;
+        }
+        var n = Number(value);
+        return Number.isFinite(n) ? n : null;
+    }
+
+    /**
+     * 税区分キー。空欄は印字時と同じく STANDARD。
+     * カスタムで 1〜100 の整数でない税率はまとめない（null）。
+     */
+    function receiptTaxMergeKey(line) {
+        var tax = String((line && line.taxCategory) || 'STANDARD').trim().toUpperCase();
+        if (tax !== 'REDUCED' && tax !== 'CUSTOM') {
+            tax = 'STANDARD';
+        }
+        if (tax !== 'CUSTOM') {
+            return tax;
+        }
+        var rate = receiptIntegerYen(line.customTaxRatePercent);
+        if (rate == null || rate < 1 || rate > 100) {
+            return null;
+        }
+        return tax + ':' + String(rate);
+    }
+
+    /**
+     * 正の整数の税抜単価だけキーに載せる。
+     * 片方だけ税抜単価がある行は、まとめ先の単価で消費税が変わるので null。
+     * 0 と未設定は印字側が税込単価へ落ちるので同じ扱い。
+     */
+    function receiptBaseMergeKey(line) {
+        if (line.basePrice == null || line.basePrice === '') {
+            return '';
+        }
+        var base = receiptIntegerYen(line.basePrice);
+        if (base == null || base < 0) {
+            return null;
+        }
+        return base > 0 ? String(base) : '';
+    }
+
+    /**
+     * トッピング名と単価の多重集合。並び順は無視する。
+     * 単価が整数円でないトッピングを含む行はまとめない。
+     */
+    function receiptToppingMergeKey(line) {
+        var toppings = normalizeReceiptToppings(extractItemToppings(line), 1);
+        var parts = [];
+        for (var i = 0; i < toppings.length; i += 1) {
+            var tp = toppings[i] || {};
+            var name = String(tp.name || '').trim();
+            var price = receiptIntegerYen(tp.price);
+            if (!name || price == null) {
+                return null;
+            }
+            parts.push(JSON.stringify([name, price]));
+        }
+        parts.sort();
+        return parts.join('|');
+    }
+
+    /**
+     * まとめられる明細のキー。まとめない行は null。
+     * 条件はすべて整数円で一致すること。
+     * 税込小計が単価×数量と一致しない行（部分キャンセルの端数、値引き、欠測）は分けたまま。
+     * クーポンと負の金額は1行のまま。
+     */
+    function receiptLineMergeKey(line) {
+        if (!line || isCouponReceiptLine(null, line)) {
+            return null;
+        }
+        var name = String(line.menuName || line.name || '').trim();
+        if (!name) {
+            return null;
+        }
+        var qty = receiptIntegerYen(line.quantity);
+        var unit = receiptIntegerYen(line.unitPrice);
+        var lineTotal = receiptIntegerYen(line.lineTotal);
+        if (qty == null || qty <= 0 || unit == null || unit < 0 || lineTotal == null || lineTotal < 0) {
+            return null;
+        }
+        var extended = unit * qty;
+        var exact = Number.isSafeInteger(extended) && lineTotal === extended;
+        // 全取消は API の小計が 0 円。実売（単価×数量）の取消とは混ぜない。
+        var voided = !!line.cancelled && lineTotal === 0;
+        if (!exact && !voided) {
+            return null;
+        }
+        var taxKey = receiptTaxMergeKey(line);
+        var baseKey = receiptBaseMergeKey(line);
+        var toppingKey = receiptToppingMergeKey(line);
+        if (taxKey == null || baseKey == null || toppingKey == null) {
+            return null;
+        }
+        return [
+            name,
+            line.cancelled ? '1' : '0',
+            exact ? 'E' : 'Z',
+            String(unit),
+            taxKey,
+            baseKey,
+            toppingKey
+        ].join('\u0001');
+    }
+
+    function scaleReceiptToppings(toppings, quantity) {
+        var qty = Number(quantity);
+        if (!Number.isFinite(qty) || qty <= 0) {
+            qty = 1;
+        }
+        var list = Array.isArray(toppings) ? toppings : [];
+        for (var i = 0; i < list.length; i += 1) {
+            var price = Number(list[i] && list[i].price);
+            if (!Number.isFinite(price)) {
+                price = 0;
+            }
+            list[i].price = price;
+            var extended = price * qty;
+            list[i].lineTotal = Number.isSafeInteger(extended) ? extended : price;
+        }
+        return list;
+    }
+
+    function toppingScaleFits(toppings, quantity) {
+        var qty = receiptIntegerYen(quantity);
+        if (qty == null || qty <= 0) {
+            return false;
+        }
+        var list = Array.isArray(toppings) ? toppings : [];
+        for (var i = 0; i < list.length; i += 1) {
+            var price = receiptIntegerYen(list[i] && list[i].price);
+            if (price == null || !Number.isSafeInteger(price * qty)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    function cloneReceiptLine(line) {
+        var src = line || {};
+        var qty = Number(src.quantity);
+        if (!Number.isFinite(qty)) {
+            qty = 0;
+        }
+        var coupon = isCouponReceiptLine(null, src);
+        var name = String(src.name || src.menuName || '').trim();
+        var menuName = src.menuName != null && String(src.menuName).trim()
+            ? String(src.menuName).trim()
+            : name;
+        return {
+            menuName: menuName,
+            name: name || menuName,
+            quantity: qty,
+            unitPrice: receiptFiniteYen(src.unitPrice),
+            basePrice: receiptFiniteYen(src.basePrice),
+            lineTotal: receiptFiniteYen(src.lineTotal),
+            cancelled: !!src.cancelled,
+            kind: coupon ? 'coupon' : (src.kind || 'item'),
+            coupon: coupon ? true : undefined,
+            discountPreset: src.discountPreset === true ? true : undefined,
+            taxCategory: src.taxCategory || null,
+            customTaxRatePercent: receiptFiniteYen(src.customTaxRatePercent),
+            toppings: normalizeReceiptToppings(extractItemToppings(src), qty > 0 ? qty : 1)
+        };
+    }
+
+    /**
+     * 数量と税込小計だけ足す。単価・税抜単価・トッピング単価は書き換えない。
+     * 合計が安全整数に収まらないときは false（行を分けたままにする）。
+     */
+    function absorbReceiptLine(dest, src) {
+        var addQty = receiptIntegerYen(src && src.quantity);
+        var addTotal = receiptIntegerYen(src && src.lineTotal);
+        if (addQty == null || addTotal == null) {
+            return false;
+        }
+        var nextQty = dest.quantity + addQty;
+        var nextTotal = dest.lineTotal + addTotal;
+        if (!Number.isSafeInteger(nextQty) || !Number.isSafeInteger(nextTotal)) {
+            return false;
+        }
+        if (!toppingScaleFits(dest.toppings, nextQty)) {
+            return false;
+        }
+        dest.quantity = nextQty;
+        dest.lineTotal = nextTotal;
+        scaleReceiptToppings(dest.toppings, nextQty);
+        return true;
+    }
+
+    /**
+     * 同じ商品でトッピング構成も同じ明細を xN の1行にまとめる。
+     * まとめるのは、名前・取消・税込単価・税区分・税抜単価・トッピングが一致し、
+     * 税込小計が単価×数量と一致する行だけ。それ以外は金額と消費税を動かさないよう分けたまま。
+     * クーポンと負の金額はまとめない。入力配列とその中身は変更しない。
+     * 同じ入力に何度かけても結果は変わらない。
+     * @param {Array<object>} lines
+     * @returns {Array<object>}
+     */
+    function groupIdenticalReceiptLines(lines) {
+        var list = Array.isArray(lines) ? lines : [];
+        var out = [];
+        var indexByKey = Object.create(null);
+        for (var i = 0; i < list.length; i += 1) {
+            var line = list[i];
+            if (!line) {
+                continue;
+            }
+            var key = receiptLineMergeKey(line);
+            var existing = key != null ? indexByKey[key] : null;
+            if (existing == null) {
+                if (key != null) {
+                    indexByKey[key] = out.length;
+                }
+                out.push(cloneReceiptLine(line));
+                continue;
+            }
+            if (!absorbReceiptLine(out[existing], line)) {
+                out.push(cloneReceiptLine(line));
+            }
+        }
+        return out;
+    }
+
     /**
      * セッション詳細（orderHistory）→ 公式レシート lines。
+     * 同一商品・同一トッピングは数量をまとめる。
      * @param {object} detail
      * @returns {Array<object>}
      */
@@ -253,7 +507,7 @@
                 });
             }
         }
-        return out;
+        return groupIdenticalReceiptLines(out);
     }
 
     /**
@@ -310,6 +564,7 @@
         if (!lines) {
             lines = [];
         }
+        lines = groupIdenticalReceiptLines(lines);
         var checkoutResult = c.checkoutResult || {};
         return {
             shop: shop,
@@ -381,11 +636,15 @@
                 customTaxRatePercent
             );
         }
-        var price = Number(inclusive) || 0;
+        var price = Math.round(Number(inclusive) || 0);
         if (!(price > 0)) {
             return 0;
         }
-        return Math.round(price / (1 + receiptEffectiveRate(taxCategory, sessionType, customTaxRatePercent)));
+        var percent = Math.floor(receiptEffectiveRate(taxCategory, sessionType, customTaxRatePercent) * 100);
+        if (percent <= 0) {
+            return price;
+        }
+        return price - Math.floor(price * percent / (100 + percent));
     }
 
     function calculateReceiptTaxTotals(cart, sessionType) {
@@ -562,7 +821,7 @@
 
     /**
      * 公式レシートを 2 バーストで返す: [ロゴ] [本文]。
-     * ロゴなし（テスト印刷）は本文 1 塊だけなので速い。
+     * ロゴなしのときは本文 1 塊だけ。テスト印刷もロゴ設定があれば同じロゴを付ける。
      * @returns {Promise<{ parts: Uint8Array[], totalBytes: number, hasBanner: boolean }>}
      */
     async function buildOfficialReceiptParts(payload) {
@@ -570,7 +829,7 @@
         var shop = p.shop || {};
         var session = p.session || {};
         var payment = p.payment || {};
-        var lines = Array.isArray(p.lines) ? p.lines : [];
+        var lines = groupIdenticalReceiptLines(Array.isArray(p.lines) ? p.lines : []);
         if (!supportsCanvasImagePrint()) {
             throw new Error('レシート印字には Canvas が必要です');
         }
@@ -638,9 +897,11 @@
             var qtyLabel = item.quantity != null && item.quantity !== ''
                 ? ('x' + item.quantity)
                 : '';
-            var price = item.lineTotal != null
-                ? formatYen(item.lineTotal)
-                : (item.unitPrice != null ? formatYen(item.unitPrice) : '');
+            var price = isCouponReceiptLine(null, item)
+                ? formatCouponYen(item)
+                : (item.lineTotal != null
+                    ? formatYen(item.lineTotal)
+                    : (item.unitPrice != null ? formatYen(item.unitPrice) : ''));
             if (isCouponReceiptLine(null, item)) {
                 var couponName = couponReceiptTitle(item);
                 if (item.cancelled) {
@@ -731,6 +992,124 @@
         return concatBytes(built.parts);
     }
 
+    var FORMAL_PROVISO_DEFAULT = 'お食事代として';
+    var FORMAL_BLANK_ADDRESSEE = '＿＿＿＿＿＿＿＿＿＿';
+    var FORMAL_STAMP_YEN = 50000;
+
+    function formalReceiptText(value) {
+        if (typeof P.sanitizeReceiptText === 'function') {
+            return P.sanitizeReceiptText(value);
+        }
+        return String(value == null ? '' : value).replace(/^\s+|\s+$/g, '');
+    }
+
+    function clipFormalText(value, max) {
+        var text = formalReceiptText(value);
+        var limit = max | 0;
+        if (limit > 0 && text.length > limit) {
+            return text.slice(0, limit);
+        }
+        return text;
+    }
+
+    function formatFormalDate(value) {
+        var d = value instanceof Date ? value : new Date(value || Date.now());
+        if (Number.isNaN(d.getTime())) {
+            d = new Date();
+        }
+        return d.getFullYear() + '年' + (d.getMonth() + 1) + '月' + d.getDate() + '日';
+    }
+
+    function formalAddresseeLine(addressee) {
+        var name = clipFormalText(addressee, 40);
+        if (!name) {
+            return FORMAL_BLANK_ADDRESSEE + ' 様';
+        }
+        return name + ' 様';
+    }
+
+    function formalProvisoText(proviso) {
+        return clipFormalText(proviso, 30) || FORMAL_PROVISO_DEFAULT;
+    }
+
+    /**
+     * 宛名つき領収書。明細レシートとは別紙。
+     * addressee が空でも手書き欄（下線＋様）で出す。
+     * @returns {Promise<{ parts: Uint8Array[], totalBytes: number, hasBanner: boolean }>}
+     */
+    async function buildFormalReceiptParts(payload) {
+        var p = payload || {};
+        var shop = p.shop || {};
+        var session = p.session || {};
+        var payment = p.payment || {};
+        if (!supportsCanvasImagePrint()) {
+            throw new Error('レシート印字には Canvas が必要です');
+        }
+
+        var bodyAcc = [cmdInit()];
+        function pushBody(chunk) {
+            if (!chunk || !chunk.length) {
+                return;
+            }
+            bodyAcc.push(chunk);
+        }
+
+        var total = session.totalAmount != null ? session.totalAmount : p.totalAmount;
+        var when = formatFormalDate(session.checkedOutAt || session.endTime || p.printedAt);
+        var method = String(payment.paymentMethod || payment.method || 'CASH').toUpperCase();
+        var phone = shop.phone || shop.phoneNumber || '';
+
+        pushBody(imageLine('領 収 書', Object.assign({ align: 'center' }, RECEIPT_TYPE.title)));
+        pushBody(imageLine(when, Object.assign({ align: 'right' }, RECEIPT_TYPE.meta)));
+        pushBody(cmdFeed(1));
+        pushBody(imageLine(formalAddresseeLine(p.addressee), Object.assign({ align: 'center' }, RECEIPT_TYPE.body)));
+        pushBody(imageSeparator());
+        pushBody(imageAmountLine('金額', formatYen(total) + '-', RECEIPT_TYPE.total));
+        pushBody(imageLine('但 ' + formalProvisoText(p.proviso), RECEIPT_TYPE.body));
+        pushBody(imageLine('上記正に領収いたしました', Object.assign({ align: 'center' }, RECEIPT_TYPE.body)));
+        pushBody(cmdFeed(1));
+        if (method === 'CARD') {
+            pushBody(imageLine('カード払い（印紙不要）', Object.assign({ align: 'center' }, RECEIPT_TYPE.small)));
+        } else if (Number(total) >= FORMAL_STAMP_YEN) {
+            pushBody(imageLine('収入印紙', Object.assign({ align: 'center' }, RECEIPT_TYPE.body)));
+            pushBody(imageLine('現金5万円以上は印紙を貼ってください', Object.assign({ align: 'center' }, RECEIPT_TYPE.small)));
+        }
+
+        pushBody(cmdFeed(1));
+        if (shop.name) {
+            pushBody(imageLine(String(shop.name), Object.assign({ align: 'center' }, RECEIPT_TYPE.shop)));
+        }
+        if (shop.address) {
+            pushBody(imageLine(String(shop.address), Object.assign({ align: 'center' }, RECEIPT_TYPE.contact)));
+        }
+        if (phone) {
+            pushBody(imageLine('TEL ' + String(phone), Object.assign({ align: 'center' }, RECEIPT_TYPE.contact)));
+        }
+        if (session.archiveId || session.sessionId || p.archiveId) {
+            pushBody(imageLine(
+                'No. ' + String(session.archiveId || p.archiveId || session.sessionId),
+                RECEIPT_TYPE.small
+            ));
+        }
+        pushBody(cmdFeed(3));
+        pushBody(cmdCut());
+
+        var parts = [];
+        if (bodyAcc.length) {
+            parts.push(concatBytes(bodyAcc));
+        }
+        var totalBytes = 0;
+        for (var pi = 0; pi < parts.length; pi += 1) {
+            totalBytes += parts[pi].length;
+        }
+        return { parts: parts, totalBytes: totalBytes, hasBanner: false };
+    }
+
+    async function buildFormalReceiptBytes(payload) {
+        var built = await buildFormalReceiptParts(payload);
+        return concatBytes(built.parts);
+    }
+
     /**
      * 印刷調整用。黒→白 10cm + 格子 10cm。意図的に ESC* を厚くする。
      */
@@ -767,12 +1146,104 @@
         };
     }
 
+    function ticketText(value) {
+        if (typeof P.sanitizeReceiptText === 'function') {
+            return P.sanitizeReceiptText(value);
+        }
+        return String(value == null ? '' : value).replace(/^\s+|\s+$/g, '');
+    }
+
+    function ticketClock(value) {
+        if (!value) {
+            return '';
+        }
+        var d = value instanceof Date ? value : new Date(value);
+        if (Number.isNaN(d.getTime())) {
+            return ticketText(value);
+        }
+        var hh = d.getHours();
+        var mm = d.getMinutes();
+        return (hh < 10 ? '0' : '') + hh + ':' + (mm < 10 ? '0' : '') + mm;
+    }
+
+    function ticketQty(item) {
+        if (!item) {
+            return 0;
+        }
+        if (item.remainingQuantity != null && item.remainingQuantity !== '') {
+            var remaining = Number(item.remainingQuantity);
+            if (Number.isFinite(remaining)) {
+                return remaining > 0 ? remaining : 0;
+            }
+        }
+        var qty = Number(item.quantity || 0);
+        var cancelled = Number(item.cancelledQuantity || 0);
+        var left = qty - (Number.isFinite(cancelled) ? cancelled : 0);
+        return left > 0 ? left : 0;
+    }
+
+    /**
+     * 厨房向けの短い注文票。金額・ロゴ・税は載せない。1 注文 1 枚。
+     * @param {object} order PendingOrderResponse 相当
+     * @returns {{ parts: Uint8Array[], totalBytes: number, hasBanner: boolean }}
+     */
+    function buildOrderTicketParts(order) {
+        if (!supportsCanvasImagePrint()) {
+            throw new Error('注文票の印字には Canvas が必要です');
+        }
+        var src = order || {};
+        var table = src.tableNumber != null && src.tableNumber !== '' ? String(src.tableNumber) : '-';
+        var chunks = [cmdInit()];
+        chunks.push(imageLine('注文票', Object.assign({ align: 'center' }, RECEIPT_TYPE.title)));
+        chunks.push(imageLine('テーブル ' + ticketText(table), {
+            align: 'center',
+            fontSize: 40,
+            height: 72
+        }));
+        var when = ticketClock(src.orderTime);
+        if (when) {
+            chunks.push(imageLine(when, Object.assign({ align: 'center' }, RECEIPT_TYPE.meta)));
+        }
+        chunks.push(imageSeparator());
+        var items = Array.isArray(src.items) ? src.items : [];
+        var printed = 0;
+        var i;
+        for (i = 0; i < items.length; i += 1) {
+            var item = items[i];
+            var qty = ticketQty(item);
+            if (!qty) {
+                continue;
+            }
+            var name = ticketText(item && (item.menuName || item.name)) || '不明';
+            chunks.push(imageLine('x' + qty + '  ' + name, RECEIPT_TYPE.item));
+            var toppings = item && Array.isArray(item.toppings) ? item.toppings : [];
+            var t;
+            for (t = 0; t < toppings.length; t += 1) {
+                var toppingName = ticketText(toppings[t] && (toppings[t].name || toppings[t].menuName)) || 'トッピング';
+                chunks.push(imageLine('　・' + toppingName, RECEIPT_TYPE.topping));
+            }
+            printed += 1;
+        }
+        if (!printed) {
+            chunks.push(imageLine('（明細なし）', RECEIPT_TYPE.body));
+        }
+        chunks.push(cmdFeed(3));
+        chunks.push(cmdCut());
+        var bytes = concatBytes(chunks);
+        return { parts: [bytes], totalBytes: bytes.length, hasBanner: false };
+    }
+
     P.PREVIEW_SAMPLE = PREVIEW_SAMPLE;
     P.shopFieldsFromShop = shopFieldsFromShop;
+    P.groupIdenticalReceiptLines = groupIdenticalReceiptLines;
+    P.computeReceiptTaxBreakdown = computeReceiptTaxBreakdown;
     P.flattenSessionReceiptLines = flattenSessionReceiptLines;
     P.buildPreviewSampleReceiptPayload = buildPreviewSampleReceiptPayload;
     P.buildCheckoutReceiptPayload = buildCheckoutReceiptPayload;
     P.buildOfficialReceiptParts = buildOfficialReceiptParts;
     P.buildOfficialReceiptBytes = buildOfficialReceiptBytes;
+    P.buildFormalReceiptParts = buildFormalReceiptParts;
+    P.buildFormalReceiptBytes = buildFormalReceiptBytes;
     P.buildPrinterLoadTestParts = buildPrinterLoadTestParts;
+    P.buildOrderTicketParts = buildOrderTicketParts;
 })(typeof window !== 'undefined' ? window : globalThis);

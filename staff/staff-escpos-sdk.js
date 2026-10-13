@@ -60,22 +60,31 @@
         return RATE_10;
     }
 
+    function ratePercent(rate) {
+        var percent = Math.floor((Number(rate) || 0) * 100);
+        return percent > 0 ? percent : 0;
+    }
+
     function deriveBaseFromTaxInclusive(taxInclusivePrice, taxCategory, referenceSessionType, customTaxRatePercent) {
-        var price = Number(taxInclusivePrice) || 0;
+        var price = Math.round(Number(taxInclusivePrice) || 0);
         if (price <= 0) {
             return 0;
         }
-        var rate = resolveEffectiveRate(taxCategory, referenceSessionType, customTaxRatePercent);
-        return Math.round(price / (1 + rate));
+        var percent = ratePercent(resolveEffectiveRate(taxCategory, referenceSessionType, customTaxRatePercent));
+        if (percent <= 0) {
+            return price;
+        }
+        var tax = Math.floor(price * percent / (100 + percent));
+        return price - tax;
     }
 
     function deriveTaxInclusiveFromBase(basePrice, taxCategory, sessionType, customTaxRatePercent) {
-        var base = Number(basePrice) || 0;
+        var base = Math.round(Number(basePrice) || 0);
         if (base <= 0) {
             return 0;
         }
-        var rate = resolveEffectiveRate(taxCategory, sessionType, customTaxRatePercent);
-        return Math.round(base * (1 + rate));
+        var percent = ratePercent(resolveEffectiveRate(taxCategory, sessionType, customTaxRatePercent));
+        return base + Math.floor(base * percent / 100);
     }
 
     function migrateLegacyTaxInclusivePrice(legacyPrice) {
@@ -211,11 +220,19 @@
     'use strict';
 
     var P = global.MasterOrderPrinter || (global.MasterOrderPrinter = {});
-    var SDK_VERSION = '1.1.5';
+    var SDK_VERSION = '1.1.10';
     var RECEIPT_DOT_WIDTH = 384;
     var IMAGE_LINE_HEIGHT = 48;
     /** ESC * 24-dot バンド高さ。紙送りもこのドット数に合わせる。 */
     var ESC_STAR_BAND_DOTS = 24;
+    /** この端末だけ。店舗プロフィールには出さない（58E と新型が同居する）。 */
+    var RASTER_FEED_KEY = 'mo.staff.rasterFeed';
+    /** 行間を帯の高さにして LF を 1 回。既定。行間 0 だと反転した同じ行を足す機種がある。 */
+    var RASTER_FEED_TIGHT = 'tight';
+    /** 行間 0 のあと ESC J 24。行間 0 を無視せず、帯のあと既定行間を足す機種向け。 */
+    var RASTER_FEED_ZERO = 'zero';
+    var RASTER_FEED_ESC_J = 'esc-j';
+    var RASTER_FEED_NATIVE = 'native';
 
     var ESC = 0x1b;
     var GS = 0x1d;
@@ -255,6 +272,77 @@
     function cmdFeedDots(dots) {
         var n = Math.max(0, Math.min(255, dots | 0));
         return new Uint8Array([ESC, 0x4a, n]);
+    }
+
+    /** LF — いまの行間だけ紙を送る。帯の高さに合わせてから出す。 */
+    function cmdLineFeed() {
+        return new Uint8Array([0x0a]);
+    }
+
+    /** ESC 3 n — 行間を n ドットにする。0 は帯の直後に反転行を足す機種がある。 */
+    function cmdSetLineSpacing(dots) {
+        var n = Math.max(0, Math.min(255, dots | 0));
+        return new Uint8Array([ESC, 0x33, n]);
+    }
+
+    /** ESC 2 — 行間をプリンタ既定へ戻す。戻さないと ESC d の空行が潰れる。 */
+    function cmdDefaultLineSpacing() {
+        return new Uint8Array([ESC, 0x32]);
+    }
+
+    function listRasterFeedModes() {
+        return [
+            {
+                id: RASTER_FEED_TIGHT,
+                label: '余白を詰める',
+                note: '行間を帯の高さ（24ドット）にしてから改行する。行の直後に上下反転した同じ行が出る機種向け。'
+            },
+            {
+                id: RASTER_FEED_ZERO,
+                label: '行間ゼロ',
+                note: '帯の前に行間を 0 にしてから 24 ドット送る。詰めても帯のあいだに白い行が残る機種向け。反転行が出たら余白を詰めるに戻す。'
+            },
+            {
+                id: RASTER_FEED_ESC_J,
+                label: '58E 互換',
+                note: '行間は触らず、各帯のあと 24 ドット送る。帯が重なる機種向け。'
+            },
+            {
+                id: RASTER_FEED_NATIVE,
+                label: 'プリンタに任せる',
+                note: '行間を帯の高さにして、帯のあと紙送りを出さない。改行しても反転行が残る機種向け。重なるときは 58E 互換に戻す。'
+            }
+        ];
+    }
+
+    function normalizeRasterFeedMode(mode) {
+        var id = String(mode || '');
+        if (id === RASTER_FEED_ESC_J || id === RASTER_FEED_NATIVE
+            || id === RASTER_FEED_TIGHT || id === RASTER_FEED_ZERO) {
+            return id;
+        }
+        return RASTER_FEED_TIGHT;
+    }
+
+    function getRasterFeedMode() {
+        try {
+            var raw = global.localStorage && global.localStorage.getItem(RASTER_FEED_KEY);
+            return normalizeRasterFeedMode(raw);
+        } catch (_e) {
+            return RASTER_FEED_TIGHT;
+        }
+    }
+
+    function setRasterFeedMode(mode) {
+        var id = normalizeRasterFeedMode(mode);
+        if (String(mode || '') !== id && mode != null && String(mode) !== '') {
+            throw new Error('未知の画像紙送りです');
+        }
+        if (!global.localStorage) {
+            throw new Error('このブラウザではプリンタ設定を保存できません');
+        }
+        global.localStorage.setItem(RASTER_FEED_KEY, id);
+        return id;
     }
 
     function cmdCut() {
@@ -643,6 +731,170 @@
         return src;
     }
 
+    function receiptLuma(r, g, b) {
+        return (r * 3 + g * 4 + b) >> 3;
+    }
+
+    function blankImageData(width, height) {
+        if (typeof ImageData !== 'undefined') {
+            return new ImageData(width, height);
+        }
+        return {
+            width: width,
+            height: height,
+            data: new Uint8ClampedArray(width * height * 4)
+        };
+    }
+
+    function pixelChroma(r, g, b) {
+        var max = r > g ? r : g;
+        if (b > max) {
+            max = b;
+        }
+        var min = r < g ? r : g;
+        if (b < min) {
+            min = b;
+        }
+        return max - min;
+    }
+
+    function medianLuma(values) {
+        if (!values.length) {
+            return 255;
+        }
+        var copy = values.slice().sort(function (a, b) {
+            return a - b;
+        });
+        return copy[copy.length >> 1];
+    }
+
+    /**
+     * ロゴの紙は白のまま残す。枠が暗い JPEG（透過を黒く潰したロゴ）は、
+     * 無彩色の暗部だけ紙に戻す。白い図形が残ったら反転して黒インクにする。
+     * 全面がまだ黒なら null（黒帯はヘッドを止めるので送らない）。
+     * @returns {ImageData|null}
+     */
+    function prepareReceiptBannerImageData(imageData, rect) {
+        var width = imageData.width;
+        var height = imageData.height;
+        var src = imageData.data;
+        var x0 = rect && rect.x != null ? Math.max(0, rect.x | 0) : 0;
+        var y0 = rect && rect.y != null ? Math.max(0, rect.y | 0) : 0;
+        var x1 = rect && rect.w != null ? Math.min(width, x0 + (rect.w | 0)) : width;
+        var y1 = rect && rect.h != null ? Math.min(height, y0 + (rect.h | 0)) : height;
+        if (x1 <= x0 || y1 <= y0) {
+            return null;
+        }
+        var border = [];
+        var y;
+        var x;
+        var i;
+        var luma;
+        var chroma;
+        var edge = 3;
+        for (y = y0; y < y1; y += 1) {
+            for (x = x0; x < x1; x += 1) {
+                var onBorder = x < x0 + edge || x >= x1 - edge || y < y0 + edge || y >= y1 - edge;
+                if (!onBorder) {
+                    continue;
+                }
+                i = (y * width + x) * 4;
+                if (src[i + 3] < 128) {
+                    border.push(255);
+                    continue;
+                }
+                border.push(receiptLuma(src[i], src[i + 1], src[i + 2]));
+            }
+        }
+        var borderMed = medianLuma(border);
+        var darkMatte = borderMed < 110;
+        var paperCutoff = darkMatte ? Math.min(96, borderMed + 42) : -1;
+        var contentSum = 0;
+        var contentN = 0;
+        for (y = y0; y < y1; y += 1) {
+            for (x = x0; x < x1; x += 1) {
+                i = (y * width + x) * 4;
+                if (src[i + 3] < 128) {
+                    continue;
+                }
+                luma = receiptLuma(src[i], src[i + 1], src[i + 2]);
+                chroma = pixelChroma(src[i], src[i + 1], src[i + 2]);
+                if (darkMatte && luma <= paperCutoff && chroma < 36) {
+                    continue;
+                }
+                contentSum += luma;
+                contentN += 1;
+            }
+        }
+        var contentMean = contentN ? (contentSum / contentN) : 255;
+        var invertArt = darkMatte && contentN >= 8 && contentMean >= 150;
+        var gray = new Uint8Array(width * height);
+        var g;
+        for (y = 0; y < height; y += 1) {
+            for (x = 0; x < width; x += 1) {
+                if (x < x0 || x >= x1 || y < y0 || y >= y1) {
+                    gray[y * width + x] = 255;
+                    continue;
+                }
+                i = (y * width + x) * 4;
+                if (src[i + 3] < 128) {
+                    gray[y * width + x] = 255;
+                    continue;
+                }
+                luma = receiptLuma(src[i], src[i + 1], src[i + 2]);
+                chroma = pixelChroma(src[i], src[i + 1], src[i + 2]);
+                if (darkMatte && luma <= paperCutoff && chroma < 36) {
+                    gray[y * width + x] = 255;
+                    continue;
+                }
+                g = invertArt ? (255 - luma) : luma;
+                gray[y * width + x] = g;
+            }
+        }
+        var out = blankImageData(width, height);
+        var ink = 0;
+        var area = 0;
+        for (y = 0; y < height; y += 1) {
+            for (x = 0; x < width; x += 1) {
+                i = (y * width + x) * 4;
+                var inRect = x >= x0 && x < x1 && y >= y0 && y < y1;
+                var tone = gray[y * width + x];
+                var dot = false;
+                if (inRect && tone < 220) {
+                    dot = tone <= 32 ? true : ditherInk(tone, x, y);
+                }
+                if (dot) {
+                    out.data[i] = 0;
+                    out.data[i + 1] = 0;
+                    out.data[i + 2] = 0;
+                    ink += 1;
+                } else {
+                    out.data[i] = 255;
+                    out.data[i + 1] = 255;
+                    out.data[i + 2] = 255;
+                }
+                out.data[i + 3] = 255;
+                if (inRect) {
+                    area += 1;
+                }
+            }
+        }
+        var inkRatio = area ? ink / area : 1;
+        if (typeof console !== 'undefined' && console.info) {
+            console.info(
+                '[escpos] banner raster',
+                'border', borderMed,
+                'matte', darkMatte,
+                'invert', invertArt,
+                'ink', inkRatio.toFixed(2)
+            );
+        }
+        if (!area || inkRatio > 0.55 || ink < 8) {
+            return null;
+        }
+        return out;
+    }
+
     /**
      * バナー等を ESC * 白黒ビットマップへ（GS v 0 は 58E 互換外のため使わない）。
      * @returns {Promise<Uint8Array|null>}
@@ -670,7 +922,17 @@
         var ctx = band.ctx;
         var ox = Math.floor((maxWidth - dw) / 2);
         ctx.drawImage(img, ox, 0, dw, dh);
-        return escStarRowsFromImageData(ctx.getImageData(0, 0, maxWidth, canvasH), 140);
+        var prepared = prepareReceiptBannerImageData(
+            ctx.getImageData(0, 0, maxWidth, canvasH),
+            { x: ox, y: 0, w: dw, h: dh }
+        );
+        if (!prepared) {
+            if (typeof console !== 'undefined' && console.warn) {
+                console.warn('receipt banner skipped; raster was solid black or empty', url);
+            }
+            return null;
+        }
+        return escStarRowsFromImageData(prepared, 200);
     }
 
     function escStarRowsFromImageData(imageData, inkThreshold) {
@@ -680,6 +942,13 @@
         var threshold = inkThreshold != null ? inkThreshold : IMAGE_INK_THRESHOLD;
         var chunks = [];
         var rowStart;
+        var feedMode = getRasterFeedMode();
+        var lineSpacing = -1;
+        if (feedMode === RASTER_FEED_TIGHT || feedMode === RASTER_FEED_NATIVE) {
+            lineSpacing = ESC_STAR_BAND_DOTS;
+        } else if (feedMode === RASTER_FEED_ZERO) {
+            lineSpacing = 0;
+        }
 
         function isInkAt(pixelIndex) {
             var a = data[pixelIndex + 3];
@@ -691,10 +960,15 @@
             return y < threshold;
         }
 
+        if (lineSpacing >= 0 && height > 0) {
+            // 行間 0 は、帯を印字したあと上下反転した同じ帯を足す機種がある。
+            // 既定は帯の高さに合わせ、LF 1 回だけ進める。
+            chunks.push(cmdSetLineSpacing(lineSpacing));
+        }
         for (rowStart = 0; rowStart < height; rowStart += ESC_STAR_BAND_DOTS) {
             var nL = width & 0xff;
             var nH = (width >> 8) & 0xff;
-            // m=33: 24-dot double-density。紙送りは LF ではなく ESC J 24 で正確に進める
+            // m=33: 24-dot double-density。紙送りは送り方ごとに LF か ESC J。
             var row = [ESC, 0x2a, 33, nL, nH];
             var x;
             for (x = 0; x < width; x += 1) {
@@ -719,8 +993,15 @@
                 row.push(b0, b1, b2);
             }
             chunks.push(new Uint8Array(row));
-            // デフォルト行間の LF だと 24dot 未満しか進まずバンドが重なり「二重」に見える
-            chunks.push(cmdFeedDots(ESC_STAR_BAND_DOTS));
+            if (feedMode === RASTER_FEED_TIGHT) {
+                chunks.push(cmdLineFeed());
+            } else if (feedMode !== RASTER_FEED_NATIVE) {
+                // 58E は既定行間の LF だと 24dot 未満しか進まず帯が重なる。ESC J 24 で進める。
+                chunks.push(cmdFeedDots(ESC_STAR_BAND_DOTS));
+            }
+        }
+        if (lineSpacing >= 0 && height > 0) {
+            chunks.push(cmdDefaultLineSpacing());
         }
         return concatBytes(chunks);
     }
@@ -869,13 +1150,20 @@
     P.cmdInit = cmdInit;
     P.cmdFeed = cmdFeed;
     P.cmdFeedDots = cmdFeedDots;
+    P.cmdSetLineSpacing = cmdSetLineSpacing;
+    P.cmdDefaultLineSpacing = cmdDefaultLineSpacing;
     P.cmdCut = cmdCut;
+    P.listRasterFeedModes = listRasterFeedModes;
+    P.getRasterFeedMode = getRasterFeedMode;
+    P.setRasterFeedMode = setRasterFeedMode;
     P.supportsCanvasImagePrint = supportsCanvasImagePrint;
     P.renderBannerEscStar = renderBannerEscStar;
+    P.prepareReceiptBannerImageData = prepareReceiptBannerImageData;
     P.imageLine = imageLine;
     P.imageAmountLine = imageAmountLine;
     P.imageItemLine = imageItemLine;
     P.imageSeparator = imageSeparator;
+    P.escStarRowsFromImageData = escStarRowsFromImageData;
     P.LOAD_TEST_STRIP_DOTS = LOAD_TEST_STRIP_DOTS;
     P.LOAD_TEST_CHUNK_DOTS = LOAD_TEST_CHUNK_DOTS;
     P.renderLoadTestFade = renderLoadTestFade;
@@ -1088,8 +1376,262 @@
         return name || 'クーポン';
     }
 
+    function formatCouponYen(item) {
+        var raw = item && item.lineTotal != null
+            ? Number(item.lineTotal)
+            : Number(item && item.unitPrice);
+        if (!Number.isFinite(raw)) {
+            raw = 0;
+        }
+        if (raw > 0) {
+            raw = -raw;
+        }
+        return formatYen(raw);
+    }
+
+    /**
+     * 円の整数だけを返す。小数・非数・安全整数外はまとめない（null）。
+     */
+    function receiptIntegerYen(value) {
+        if (value == null || value === '') {
+            return null;
+        }
+        var n = Number(value);
+        if (!Number.isSafeInteger(n)) {
+            return null;
+        }
+        return n;
+    }
+
+    function receiptFiniteYen(value) {
+        if (value == null || value === '') {
+            return null;
+        }
+        var n = Number(value);
+        return Number.isFinite(n) ? n : null;
+    }
+
+    /**
+     * 税区分キー。空欄は印字時と同じく STANDARD。
+     * カスタムで 1〜100 の整数でない税率はまとめない（null）。
+     */
+    function receiptTaxMergeKey(line) {
+        var tax = String((line && line.taxCategory) || 'STANDARD').trim().toUpperCase();
+        if (tax !== 'REDUCED' && tax !== 'CUSTOM') {
+            tax = 'STANDARD';
+        }
+        if (tax !== 'CUSTOM') {
+            return tax;
+        }
+        var rate = receiptIntegerYen(line.customTaxRatePercent);
+        if (rate == null || rate < 1 || rate > 100) {
+            return null;
+        }
+        return tax + ':' + String(rate);
+    }
+
+    /**
+     * 正の整数の税抜単価だけキーに載せる。
+     * 片方だけ税抜単価がある行は、まとめ先の単価で消費税が変わるので null。
+     * 0 と未設定は印字側が税込単価へ落ちるので同じ扱い。
+     */
+    function receiptBaseMergeKey(line) {
+        if (line.basePrice == null || line.basePrice === '') {
+            return '';
+        }
+        var base = receiptIntegerYen(line.basePrice);
+        if (base == null || base < 0) {
+            return null;
+        }
+        return base > 0 ? String(base) : '';
+    }
+
+    /**
+     * トッピング名と単価の多重集合。並び順は無視する。
+     * 単価が整数円でないトッピングを含む行はまとめない。
+     */
+    function receiptToppingMergeKey(line) {
+        var toppings = normalizeReceiptToppings(extractItemToppings(line), 1);
+        var parts = [];
+        for (var i = 0; i < toppings.length; i += 1) {
+            var tp = toppings[i] || {};
+            var name = String(tp.name || '').trim();
+            var price = receiptIntegerYen(tp.price);
+            if (!name || price == null) {
+                return null;
+            }
+            parts.push(JSON.stringify([name, price]));
+        }
+        parts.sort();
+        return parts.join('|');
+    }
+
+    /**
+     * まとめられる明細のキー。まとめない行は null。
+     * 条件はすべて整数円で一致すること。
+     * 税込小計が単価×数量と一致しない行（部分キャンセルの端数、値引き、欠測）は分けたまま。
+     * クーポンと負の金額は1行のまま。
+     */
+    function receiptLineMergeKey(line) {
+        if (!line || isCouponReceiptLine(null, line)) {
+            return null;
+        }
+        var name = String(line.menuName || line.name || '').trim();
+        if (!name) {
+            return null;
+        }
+        var qty = receiptIntegerYen(line.quantity);
+        var unit = receiptIntegerYen(line.unitPrice);
+        var lineTotal = receiptIntegerYen(line.lineTotal);
+        if (qty == null || qty <= 0 || unit == null || unit < 0 || lineTotal == null || lineTotal < 0) {
+            return null;
+        }
+        var extended = unit * qty;
+        var exact = Number.isSafeInteger(extended) && lineTotal === extended;
+        // 全取消は API の小計が 0 円。実売（単価×数量）の取消とは混ぜない。
+        var voided = !!line.cancelled && lineTotal === 0;
+        if (!exact && !voided) {
+            return null;
+        }
+        var taxKey = receiptTaxMergeKey(line);
+        var baseKey = receiptBaseMergeKey(line);
+        var toppingKey = receiptToppingMergeKey(line);
+        if (taxKey == null || baseKey == null || toppingKey == null) {
+            return null;
+        }
+        return [
+            name,
+            line.cancelled ? '1' : '0',
+            exact ? 'E' : 'Z',
+            String(unit),
+            taxKey,
+            baseKey,
+            toppingKey
+        ].join('\u0001');
+    }
+
+    function scaleReceiptToppings(toppings, quantity) {
+        var qty = Number(quantity);
+        if (!Number.isFinite(qty) || qty <= 0) {
+            qty = 1;
+        }
+        var list = Array.isArray(toppings) ? toppings : [];
+        for (var i = 0; i < list.length; i += 1) {
+            var price = Number(list[i] && list[i].price);
+            if (!Number.isFinite(price)) {
+                price = 0;
+            }
+            list[i].price = price;
+            var extended = price * qty;
+            list[i].lineTotal = Number.isSafeInteger(extended) ? extended : price;
+        }
+        return list;
+    }
+
+    function toppingScaleFits(toppings, quantity) {
+        var qty = receiptIntegerYen(quantity);
+        if (qty == null || qty <= 0) {
+            return false;
+        }
+        var list = Array.isArray(toppings) ? toppings : [];
+        for (var i = 0; i < list.length; i += 1) {
+            var price = receiptIntegerYen(list[i] && list[i].price);
+            if (price == null || !Number.isSafeInteger(price * qty)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    function cloneReceiptLine(line) {
+        var src = line || {};
+        var qty = Number(src.quantity);
+        if (!Number.isFinite(qty)) {
+            qty = 0;
+        }
+        var coupon = isCouponReceiptLine(null, src);
+        var name = String(src.name || src.menuName || '').trim();
+        var menuName = src.menuName != null && String(src.menuName).trim()
+            ? String(src.menuName).trim()
+            : name;
+        return {
+            menuName: menuName,
+            name: name || menuName,
+            quantity: qty,
+            unitPrice: receiptFiniteYen(src.unitPrice),
+            basePrice: receiptFiniteYen(src.basePrice),
+            lineTotal: receiptFiniteYen(src.lineTotal),
+            cancelled: !!src.cancelled,
+            kind: coupon ? 'coupon' : (src.kind || 'item'),
+            coupon: coupon ? true : undefined,
+            discountPreset: src.discountPreset === true ? true : undefined,
+            taxCategory: src.taxCategory || null,
+            customTaxRatePercent: receiptFiniteYen(src.customTaxRatePercent),
+            toppings: normalizeReceiptToppings(extractItemToppings(src), qty > 0 ? qty : 1)
+        };
+    }
+
+    /**
+     * 数量と税込小計だけ足す。単価・税抜単価・トッピング単価は書き換えない。
+     * 合計が安全整数に収まらないときは false（行を分けたままにする）。
+     */
+    function absorbReceiptLine(dest, src) {
+        var addQty = receiptIntegerYen(src && src.quantity);
+        var addTotal = receiptIntegerYen(src && src.lineTotal);
+        if (addQty == null || addTotal == null) {
+            return false;
+        }
+        var nextQty = dest.quantity + addQty;
+        var nextTotal = dest.lineTotal + addTotal;
+        if (!Number.isSafeInteger(nextQty) || !Number.isSafeInteger(nextTotal)) {
+            return false;
+        }
+        if (!toppingScaleFits(dest.toppings, nextQty)) {
+            return false;
+        }
+        dest.quantity = nextQty;
+        dest.lineTotal = nextTotal;
+        scaleReceiptToppings(dest.toppings, nextQty);
+        return true;
+    }
+
+    /**
+     * 同じ商品でトッピング構成も同じ明細を xN の1行にまとめる。
+     * まとめるのは、名前・取消・税込単価・税区分・税抜単価・トッピングが一致し、
+     * 税込小計が単価×数量と一致する行だけ。それ以外は金額と消費税を動かさないよう分けたまま。
+     * クーポンと負の金額はまとめない。入力配列とその中身は変更しない。
+     * 同じ入力に何度かけても結果は変わらない。
+     * @param {Array<object>} lines
+     * @returns {Array<object>}
+     */
+    function groupIdenticalReceiptLines(lines) {
+        var list = Array.isArray(lines) ? lines : [];
+        var out = [];
+        var indexByKey = Object.create(null);
+        for (var i = 0; i < list.length; i += 1) {
+            var line = list[i];
+            if (!line) {
+                continue;
+            }
+            var key = receiptLineMergeKey(line);
+            var existing = key != null ? indexByKey[key] : null;
+            if (existing == null) {
+                if (key != null) {
+                    indexByKey[key] = out.length;
+                }
+                out.push(cloneReceiptLine(line));
+                continue;
+            }
+            if (!absorbReceiptLine(out[existing], line)) {
+                out.push(cloneReceiptLine(line));
+            }
+        }
+        return out;
+    }
+
     /**
      * セッション詳細（orderHistory）→ 公式レシート lines。
+     * 同一商品・同一トッピングは数量をまとめる。
      * @param {object} detail
      * @returns {Array<object>}
      */
@@ -1140,7 +1682,7 @@
                 });
             }
         }
-        return out;
+        return groupIdenticalReceiptLines(out);
     }
 
     /**
@@ -1197,6 +1739,7 @@
         if (!lines) {
             lines = [];
         }
+        lines = groupIdenticalReceiptLines(lines);
         var checkoutResult = c.checkoutResult || {};
         return {
             shop: shop,
@@ -1268,11 +1811,15 @@
                 customTaxRatePercent
             );
         }
-        var price = Number(inclusive) || 0;
+        var price = Math.round(Number(inclusive) || 0);
         if (!(price > 0)) {
             return 0;
         }
-        return Math.round(price / (1 + receiptEffectiveRate(taxCategory, sessionType, customTaxRatePercent)));
+        var percent = Math.floor(receiptEffectiveRate(taxCategory, sessionType, customTaxRatePercent) * 100);
+        if (percent <= 0) {
+            return price;
+        }
+        return price - Math.floor(price * percent / (100 + percent));
     }
 
     function calculateReceiptTaxTotals(cart, sessionType) {
@@ -1449,7 +1996,7 @@
 
     /**
      * 公式レシートを 2 バーストで返す: [ロゴ] [本文]。
-     * ロゴなし（テスト印刷）は本文 1 塊だけなので速い。
+     * ロゴなしのときは本文 1 塊だけ。テスト印刷もロゴ設定があれば同じロゴを付ける。
      * @returns {Promise<{ parts: Uint8Array[], totalBytes: number, hasBanner: boolean }>}
      */
     async function buildOfficialReceiptParts(payload) {
@@ -1457,7 +2004,7 @@
         var shop = p.shop || {};
         var session = p.session || {};
         var payment = p.payment || {};
-        var lines = Array.isArray(p.lines) ? p.lines : [];
+        var lines = groupIdenticalReceiptLines(Array.isArray(p.lines) ? p.lines : []);
         if (!supportsCanvasImagePrint()) {
             throw new Error('レシート印字には Canvas が必要です');
         }
@@ -1525,9 +2072,11 @@
             var qtyLabel = item.quantity != null && item.quantity !== ''
                 ? ('x' + item.quantity)
                 : '';
-            var price = item.lineTotal != null
-                ? formatYen(item.lineTotal)
-                : (item.unitPrice != null ? formatYen(item.unitPrice) : '');
+            var price = isCouponReceiptLine(null, item)
+                ? formatCouponYen(item)
+                : (item.lineTotal != null
+                    ? formatYen(item.lineTotal)
+                    : (item.unitPrice != null ? formatYen(item.unitPrice) : ''));
             if (isCouponReceiptLine(null, item)) {
                 var couponName = couponReceiptTitle(item);
                 if (item.cancelled) {
@@ -1618,6 +2167,124 @@
         return concatBytes(built.parts);
     }
 
+    var FORMAL_PROVISO_DEFAULT = 'お食事代として';
+    var FORMAL_BLANK_ADDRESSEE = '＿＿＿＿＿＿＿＿＿＿';
+    var FORMAL_STAMP_YEN = 50000;
+
+    function formalReceiptText(value) {
+        if (typeof P.sanitizeReceiptText === 'function') {
+            return P.sanitizeReceiptText(value);
+        }
+        return String(value == null ? '' : value).replace(/^\s+|\s+$/g, '');
+    }
+
+    function clipFormalText(value, max) {
+        var text = formalReceiptText(value);
+        var limit = max | 0;
+        if (limit > 0 && text.length > limit) {
+            return text.slice(0, limit);
+        }
+        return text;
+    }
+
+    function formatFormalDate(value) {
+        var d = value instanceof Date ? value : new Date(value || Date.now());
+        if (Number.isNaN(d.getTime())) {
+            d = new Date();
+        }
+        return d.getFullYear() + '年' + (d.getMonth() + 1) + '月' + d.getDate() + '日';
+    }
+
+    function formalAddresseeLine(addressee) {
+        var name = clipFormalText(addressee, 40);
+        if (!name) {
+            return FORMAL_BLANK_ADDRESSEE + ' 様';
+        }
+        return name + ' 様';
+    }
+
+    function formalProvisoText(proviso) {
+        return clipFormalText(proviso, 30) || FORMAL_PROVISO_DEFAULT;
+    }
+
+    /**
+     * 宛名つき領収書。明細レシートとは別紙。
+     * addressee が空でも手書き欄（下線＋様）で出す。
+     * @returns {Promise<{ parts: Uint8Array[], totalBytes: number, hasBanner: boolean }>}
+     */
+    async function buildFormalReceiptParts(payload) {
+        var p = payload || {};
+        var shop = p.shop || {};
+        var session = p.session || {};
+        var payment = p.payment || {};
+        if (!supportsCanvasImagePrint()) {
+            throw new Error('レシート印字には Canvas が必要です');
+        }
+
+        var bodyAcc = [cmdInit()];
+        function pushBody(chunk) {
+            if (!chunk || !chunk.length) {
+                return;
+            }
+            bodyAcc.push(chunk);
+        }
+
+        var total = session.totalAmount != null ? session.totalAmount : p.totalAmount;
+        var when = formatFormalDate(session.checkedOutAt || session.endTime || p.printedAt);
+        var method = String(payment.paymentMethod || payment.method || 'CASH').toUpperCase();
+        var phone = shop.phone || shop.phoneNumber || '';
+
+        pushBody(imageLine('領 収 書', Object.assign({ align: 'center' }, RECEIPT_TYPE.title)));
+        pushBody(imageLine(when, Object.assign({ align: 'right' }, RECEIPT_TYPE.meta)));
+        pushBody(cmdFeed(1));
+        pushBody(imageLine(formalAddresseeLine(p.addressee), Object.assign({ align: 'center' }, RECEIPT_TYPE.body)));
+        pushBody(imageSeparator());
+        pushBody(imageAmountLine('金額', formatYen(total) + '-', RECEIPT_TYPE.total));
+        pushBody(imageLine('但 ' + formalProvisoText(p.proviso), RECEIPT_TYPE.body));
+        pushBody(imageLine('上記正に領収いたしました', Object.assign({ align: 'center' }, RECEIPT_TYPE.body)));
+        pushBody(cmdFeed(1));
+        if (method === 'CARD') {
+            pushBody(imageLine('カード払い（印紙不要）', Object.assign({ align: 'center' }, RECEIPT_TYPE.small)));
+        } else if (Number(total) >= FORMAL_STAMP_YEN) {
+            pushBody(imageLine('収入印紙', Object.assign({ align: 'center' }, RECEIPT_TYPE.body)));
+            pushBody(imageLine('現金5万円以上は印紙を貼ってください', Object.assign({ align: 'center' }, RECEIPT_TYPE.small)));
+        }
+
+        pushBody(cmdFeed(1));
+        if (shop.name) {
+            pushBody(imageLine(String(shop.name), Object.assign({ align: 'center' }, RECEIPT_TYPE.shop)));
+        }
+        if (shop.address) {
+            pushBody(imageLine(String(shop.address), Object.assign({ align: 'center' }, RECEIPT_TYPE.contact)));
+        }
+        if (phone) {
+            pushBody(imageLine('TEL ' + String(phone), Object.assign({ align: 'center' }, RECEIPT_TYPE.contact)));
+        }
+        if (session.archiveId || session.sessionId || p.archiveId) {
+            pushBody(imageLine(
+                'No. ' + String(session.archiveId || p.archiveId || session.sessionId),
+                RECEIPT_TYPE.small
+            ));
+        }
+        pushBody(cmdFeed(3));
+        pushBody(cmdCut());
+
+        var parts = [];
+        if (bodyAcc.length) {
+            parts.push(concatBytes(bodyAcc));
+        }
+        var totalBytes = 0;
+        for (var pi = 0; pi < parts.length; pi += 1) {
+            totalBytes += parts[pi].length;
+        }
+        return { parts: parts, totalBytes: totalBytes, hasBanner: false };
+    }
+
+    async function buildFormalReceiptBytes(payload) {
+        var built = await buildFormalReceiptParts(payload);
+        return concatBytes(built.parts);
+    }
+
     /**
      * 印刷調整用。黒→白 10cm + 格子 10cm。意図的に ESC* を厚くする。
      */
@@ -1654,14 +2321,106 @@
         };
     }
 
+    function ticketText(value) {
+        if (typeof P.sanitizeReceiptText === 'function') {
+            return P.sanitizeReceiptText(value);
+        }
+        return String(value == null ? '' : value).replace(/^\s+|\s+$/g, '');
+    }
+
+    function ticketClock(value) {
+        if (!value) {
+            return '';
+        }
+        var d = value instanceof Date ? value : new Date(value);
+        if (Number.isNaN(d.getTime())) {
+            return ticketText(value);
+        }
+        var hh = d.getHours();
+        var mm = d.getMinutes();
+        return (hh < 10 ? '0' : '') + hh + ':' + (mm < 10 ? '0' : '') + mm;
+    }
+
+    function ticketQty(item) {
+        if (!item) {
+            return 0;
+        }
+        if (item.remainingQuantity != null && item.remainingQuantity !== '') {
+            var remaining = Number(item.remainingQuantity);
+            if (Number.isFinite(remaining)) {
+                return remaining > 0 ? remaining : 0;
+            }
+        }
+        var qty = Number(item.quantity || 0);
+        var cancelled = Number(item.cancelledQuantity || 0);
+        var left = qty - (Number.isFinite(cancelled) ? cancelled : 0);
+        return left > 0 ? left : 0;
+    }
+
+    /**
+     * 厨房向けの短い注文票。金額・ロゴ・税は載せない。1 注文 1 枚。
+     * @param {object} order PendingOrderResponse 相当
+     * @returns {{ parts: Uint8Array[], totalBytes: number, hasBanner: boolean }}
+     */
+    function buildOrderTicketParts(order) {
+        if (!supportsCanvasImagePrint()) {
+            throw new Error('注文票の印字には Canvas が必要です');
+        }
+        var src = order || {};
+        var table = src.tableNumber != null && src.tableNumber !== '' ? String(src.tableNumber) : '-';
+        var chunks = [cmdInit()];
+        chunks.push(imageLine('注文票', Object.assign({ align: 'center' }, RECEIPT_TYPE.title)));
+        chunks.push(imageLine('テーブル ' + ticketText(table), {
+            align: 'center',
+            fontSize: 40,
+            height: 72
+        }));
+        var when = ticketClock(src.orderTime);
+        if (when) {
+            chunks.push(imageLine(when, Object.assign({ align: 'center' }, RECEIPT_TYPE.meta)));
+        }
+        chunks.push(imageSeparator());
+        var items = Array.isArray(src.items) ? src.items : [];
+        var printed = 0;
+        var i;
+        for (i = 0; i < items.length; i += 1) {
+            var item = items[i];
+            var qty = ticketQty(item);
+            if (!qty) {
+                continue;
+            }
+            var name = ticketText(item && (item.menuName || item.name)) || '不明';
+            chunks.push(imageLine('x' + qty + '  ' + name, RECEIPT_TYPE.item));
+            var toppings = item && Array.isArray(item.toppings) ? item.toppings : [];
+            var t;
+            for (t = 0; t < toppings.length; t += 1) {
+                var toppingName = ticketText(toppings[t] && (toppings[t].name || toppings[t].menuName)) || 'トッピング';
+                chunks.push(imageLine('　・' + toppingName, RECEIPT_TYPE.topping));
+            }
+            printed += 1;
+        }
+        if (!printed) {
+            chunks.push(imageLine('（明細なし）', RECEIPT_TYPE.body));
+        }
+        chunks.push(cmdFeed(3));
+        chunks.push(cmdCut());
+        var bytes = concatBytes(chunks);
+        return { parts: [bytes], totalBytes: bytes.length, hasBanner: false };
+    }
+
     P.PREVIEW_SAMPLE = PREVIEW_SAMPLE;
     P.shopFieldsFromShop = shopFieldsFromShop;
+    P.groupIdenticalReceiptLines = groupIdenticalReceiptLines;
+    P.computeReceiptTaxBreakdown = computeReceiptTaxBreakdown;
     P.flattenSessionReceiptLines = flattenSessionReceiptLines;
     P.buildPreviewSampleReceiptPayload = buildPreviewSampleReceiptPayload;
     P.buildCheckoutReceiptPayload = buildCheckoutReceiptPayload;
     P.buildOfficialReceiptParts = buildOfficialReceiptParts;
     P.buildOfficialReceiptBytes = buildOfficialReceiptBytes;
+    P.buildFormalReceiptParts = buildFormalReceiptParts;
+    P.buildFormalReceiptBytes = buildFormalReceiptBytes;
     P.buildPrinterLoadTestParts = buildPrinterLoadTestParts;
+    P.buildOrderTicketParts = buildOrderTicketParts;
 })(typeof window !== 'undefined' ? window : globalThis);
 
 ;/* --- printer/printer-modes.js --- */
@@ -1845,6 +2604,9 @@
     var PACE_KEY = 'mo.staff.serialPace';
     var USB_CHUNK = 512;
     var SERIAL_CHUNK = 1024;
+    /** 本文はインクが薄い。ロゴ用に下げた 512B 間隔のまま送らない。 */
+    var TEXT_SLICE_BYTES = 4096;
+    var TEXT_SLICE_MS = 40;
     var DEFAULT_TCP_PORT = 9100;
     /** マニュアルモードの入力バッファ（1 回に溜めるバイト）。大きいほうから一段下げて余裕を残す。 */
     var BUFFER_PRESETS = [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536];
@@ -2537,7 +3299,8 @@
 
     function setDefaultPrinter(entry) {
         var saved = writeDefaultPrinter(entry);
-        if (saved && saved.transport && typeof P.getPrinterMode === 'function'
+        if (saved && saved.transport && saved.transport !== 'os'
+            && typeof P.getPrinterMode === 'function'
             && typeof P.setPrinterMode === 'function'
             && P.getPrinterMode() === 'windows-driver') {
             try {
@@ -2633,33 +3396,30 @@
     async function listConnectedPrinters() {
         var def = readDefaultPrinter();
         var out = [];
-        if (supportsNativePrinter()) {
+        if (isNativePlatform()) {
             var plugin = getNativeEscPosPlugin();
-            try {
-                if (plugin && typeof plugin.requestPermissions === 'function') {
-                    await plugin.requestPermissions();
+            if (!plugin || typeof plugin.listBluetoothDevices !== 'function') {
+                throw new Error('このアプリから Bluetooth プリンタを読み取れません。アプリを更新してください。');
+            }
+            if (typeof plugin.requestPermissions === 'function') {
+                await plugin.requestPermissions();
+            }
+            var listed = await plugin.listBluetoothDevices();
+            var devices = (listed && listed.devices) || [];
+            for (var bi = 0; bi < devices.length; bi += 1) {
+                var bt = devices[bi] || {};
+                var address = String(bt.address || '');
+                if (!address) {
+                    continue;
                 }
-                var listed = plugin && typeof plugin.listBluetoothDevices === 'function'
-                    ? await plugin.listBluetoothDevices()
-                    : { devices: [] };
-                var devices = (listed && listed.devices) || [];
-                for (var bi = 0; bi < devices.length; bi += 1) {
-                    var bt = devices[bi] || {};
-                    var address = String(bt.address || '');
-                    if (!address) {
-                        continue;
-                    }
-                    var bid = 'bluetooth:' + address;
-                    out.push({
-                        id: bid,
-                        transport: 'bluetooth',
-                        label: String(bt.name || address),
-                        address: address,
-                        isDefault: !!(def && def.id === bid)
-                    });
-                }
-            } catch (_btList) {
-                /* ignore list errors; still show saved default below */
+                var bid = 'bluetooth:' + address;
+                out.push({
+                    id: bid,
+                    transport: 'bluetooth',
+                    label: String(bt.name || address),
+                    address: address,
+                    isDefault: !!(def && def.id === bid)
+                });
             }
             if (def && (def.transport === 'tcp' || def.transport === 'bluetooth')) {
                 var already = out.some(function (row) { return row.id === def.id; });
@@ -2849,9 +3609,6 @@
     }
 
     function requestTcpPrinter(host, port) {
-        if (!supportsNativePrinter()) {
-            throw new Error('LAN/TCP 印刷は Android アプリでのみ利用できます');
-        }
         var h = String(host || '').trim();
         if (!h) {
             throw new Error('プリンタのホスト（IP）が必要です');
@@ -3165,20 +3922,119 @@
     }
 
     /**
-     * 1 バーストを 1024 バイトずつ書く。
+     * 待ちを ESC * の途中に入れない。新型はコマンドの切れ目で改行し、帯が縦に割れる。
+     * 1 コマンドがバッファより長くても、そのコマンドは分割しない。
+     */
+    function escPosCommandLength(data, offset) {
+        var i = offset | 0;
+        var len = data.length;
+        if (i >= len) {
+            return 0;
+        }
+        var b = data[i];
+        if (b === 0x1b && i + 1 < len) {
+            var cmd = data[i + 1];
+            if (cmd === 0x40 || cmd === 0x32) {
+                return 2;
+            }
+            if (cmd === 0x4a || cmd === 0x64 || cmd === 0x33) {
+                return i + 3 <= len ? 3 : (len - i);
+            }
+            if (cmd === 0x2a && i + 4 < len) {
+                var m = data[i + 2];
+                var cols = data[i + 3] + (data[i + 4] << 8);
+                var bytesPerCol = (m === 0 || m === 1) ? 1 : 3;
+                var need = 5 + cols * bytesPerCol;
+                if (need < 5) {
+                    need = 5;
+                }
+                var end = i + need;
+                if (end + 2 < len && data[end] === 0x1b && data[end + 1] === 0x4a) {
+                    need += 3;
+                } else if (end < len && (data[end] === 0x0a || data[end] === 0x0d)) {
+                    need += 1;
+                }
+                return i + need <= len ? need : (len - i);
+            }
+        }
+        if (b === 0x1d && i + 1 < len && data[i + 1] === 0x56) {
+            if (i + 2 < len && data[i + 2] >= 65) {
+                return i + 4 <= len ? 4 : (len - i);
+            }
+            return i + 3 <= len ? 3 : (len - i);
+        }
+        return 1;
+    }
+
+    function sliceEscPosAtCommands(data, maxBytes) {
+        var bytes = data instanceof Uint8Array ? data : new Uint8Array(data || []);
+        var limit = maxBytes | 0;
+        if (limit < 1) {
+            limit = 1;
+        }
+        var slices = [];
+        var start = 0;
+        var i = 0;
+        while (i < bytes.length) {
+            var n = escPosCommandLength(bytes, i);
+            if (n < 1) {
+                break;
+            }
+            var next = i + n;
+            if (next > bytes.length) {
+                next = bytes.length;
+            }
+            if (start < i && (next - start) > limit) {
+                slices.push(bytes.subarray(start, i));
+                start = i;
+            }
+            i = next;
+        }
+        if (start < bytes.length) {
+            slices.push(bytes.subarray(start, bytes.length));
+        }
+        return slices;
+    }
+
+    /**
+     * 1 バーストをコマンド境界で切って書く。
      * 大きい塊はプロファイル単位で releaseLock してから待つ（握ったまま待たない）。
      * port.close() もしない。keep-open。
      */
-    async function writeSerialBytes(port, data, ctx) {
+    function burstKind(list, index, ctx) {
+        if (ctx && (ctx.calibrate || ctx.keepBursts)) {
+            return 'tune';
+        }
+        if (list.length > 1 && index === 0) {
+            return 'logo';
+        }
+        return 'text';
+    }
+
+    function paceForBurst(pace, kind) {
+        if (kind !== 'text') {
+            return pace;
+        }
+        return {
+            paceBytes: Math.max(pace.paceBytes, TEXT_SLICE_BYTES),
+            paceMs: Math.min(pace.paceMs, TEXT_SLICE_MS),
+            logoPauseMs: pace.logoPauseMs,
+            digestPerKb: Math.min(pace.digestPerKb, 25),
+            digestMax: Math.min(pace.digestMax, 900),
+            label: 'text ' + TEXT_SLICE_BYTES + 'B/' + TEXT_SLICE_MS + 'ms'
+        };
+    }
+
+    async function writeSerialBytes(port, data, ctx, paceOpt) {
         if (!data || !data.length) {
             return;
         }
-        var pace = currentPace();
+        var pace = paceOpt || currentPace();
         var sliceWait = (ctx && ctx.calibrate) ? Math.max(pace.paceMs, 280) : pace.paceMs;
-        var offset = 0;
-        while (offset < data.length) {
-            var end = Math.min(offset + pace.paceBytes, data.length);
-            var slice = data.subarray(offset, end);
+        var slices = sliceEscPosAtCommands(data, pace.paceBytes);
+        var si;
+        for (si = 0; si < slices.length; si += 1) {
+            var slice = slices[si];
             var writer = port.writable.getWriter();
             try {
                 var i;
@@ -3188,8 +4044,7 @@
             } finally {
                 writer.releaseLock();
             }
-            offset = end;
-            if (offset < data.length) {
+            if (si + 1 < slices.length) {
                 await sleepMs(sliceWait);
             }
         }
@@ -3275,14 +4130,15 @@
                 throw new Error(beforeErr);
             }
             for (i = 0; i < list.length; i += 1) {
+                var kind = burstKind(list, i, ctx);
+                var burstPace = paceForBurst(pace, kind);
                 if (typeof console !== 'undefined' && console.info) {
-                    console.info('[escpos] serial burst', i + 1, '/', list.length, 'bytes=', list[i].length);
+                    console.info('[escpos] serial burst', i + 1, '/', list.length, kind, 'bytes=', list[i].length, burstPace.paceBytes + 'B/' + burstPace.paceMs + 'ms');
                 }
-                await writeSerialBytes(port, list[i], ctx);
-                var waitMs = Math.max(
-                    (i < list.length - 1) ? pace.logoPauseMs : 0,
-                    postWriteDigestMs(list[i].length, pace)
-                );
+                await writeSerialBytes(port, list[i], ctx, burstPace);
+                var waitMs = kind === 'logo'
+                    ? Math.max(pace.logoPauseMs, postWriteDigestMs(list[i].length, pace))
+                    : postWriteDigestMs(list[i].length, burstPace);
                 if (ctx && ctx.calibrate) {
                     waitMs = Math.max(waitMs, 1200);
                 }
@@ -3376,23 +4232,29 @@
             claimedIface = ep.interfaceNumber;
             var pace = currentPace();
             for (i = 0; i < list.length; i += 1) {
+                var kind = burstKind(list, i, null);
+                var burstPace = paceForBurst(pace, kind);
                 var data = list[i];
-                var offset = 0;
-                while (offset < data.length) {
-                    var sliceEnd = Math.min(offset + pace.paceBytes, data.length);
-                    while (offset < sliceEnd) {
-                        var chunk = data.subarray(offset, Math.min(offset + USB_CHUNK, sliceEnd));
+                var slices = sliceEscPosAtCommands(data, burstPace.paceBytes);
+                var si;
+                for (si = 0; si < slices.length; si += 1) {
+                    var slice = slices[si];
+                    var offset = 0;
+                    while (offset < slice.length) {
+                        var chunk = slice.subarray(offset, Math.min(offset + USB_CHUNK, slice.length));
                         var result = await device.transferOut(ep.endpointNumber, chunk);
                         if (result.status !== 'ok') {
                             throw new Error('USB 転送に失敗しました (' + result.status + ')');
                         }
                         offset += chunk.length;
                     }
-                    if (offset < data.length) {
-                        await sleepMs(pace.paceMs);
+                    if (si + 1 < slices.length) {
+                        await sleepMs(burstPace.paceMs);
                     }
                 }
-                var waitMs = (i < list.length - 1) ? pace.logoPauseMs : postWriteDigestMs(totalBytes, pace);
+                var waitMs = kind === 'logo'
+                    ? Math.max(pace.logoPauseMs, postWriteDigestMs(data.length, pace))
+                    : postWriteDigestMs(data.length, burstPace);
                 await sleepMs(waitMs);
             }
         } catch (err) {
@@ -3413,7 +4275,7 @@
 
     async function resolvePrinterTarget(preferred) {
         var want = preferred || readDefaultPrinter();
-        if (want && (want.transport === 'bluetooth' || want.transport === 'tcp')) {
+        if (want && (want.transport === 'bluetooth' || want.transport === 'tcp' || want.transport === 'os')) {
             return want;
         }
         var list = await listConnectedPrinters();
@@ -3555,34 +4417,39 @@
         var gapMs = pace && pace.paceMs ? Math.min(Math.max(pace.paceMs, 20), 80) : 20;
         var sizes = [512, 256, 128, 20];
         var chunk = sizes[0];
-        var offset = 0;
         var bytes = data instanceof Uint8Array ? data : new Uint8Array(data || []);
-        while (offset < bytes.length) {
-            var end = Math.min(offset + chunk, bytes.length);
-            var slice = bytes.subarray(offset, end);
-            try {
-                if (without) {
-                    await characteristic.writeValueWithoutResponse(slice);
-                } else {
-                    await characteristic.writeValue(slice);
-                }
-            } catch (err) {
-                var next = 0;
-                var si;
-                for (si = 0; si < sizes.length; si += 1) {
-                    if (sizes[si] < chunk) {
-                        next = sizes[si];
-                        break;
+        var commands = sliceEscPosAtCommands(bytes, 1);
+        var ci;
+        for (ci = 0; ci < commands.length; ci += 1) {
+            var block = commands[ci];
+            var offset = 0;
+            while (offset < block.length) {
+                var end = Math.min(offset + chunk, block.length);
+                var slice = block.subarray(offset, end);
+                try {
+                    if (without) {
+                        await characteristic.writeValueWithoutResponse(slice);
+                    } else {
+                        await characteristic.writeValue(slice);
                     }
+                } catch (err) {
+                    var next = 0;
+                    var si;
+                    for (si = 0; si < sizes.length; si += 1) {
+                        if (sizes[si] < chunk) {
+                            next = sizes[si];
+                            break;
+                        }
+                    }
+                    if (next && /GATT|Invalid|too long|exceeds|length/i.test(String(err && (err.message || err.name) || ''))) {
+                        chunk = next;
+                        continue;
+                    }
+                    throw err;
                 }
-                if (next && /GATT|Invalid|too long|exceeds|length/i.test(String(err && (err.message || err.name) || ''))) {
-                    chunk = next;
-                    continue;
-                }
-                throw err;
+                offset = end;
             }
-            offset = end;
-            if (offset < bytes.length && gapMs) {
+            if (ci + 1 < commands.length && gapMs) {
                 await sleepMs(gapMs);
             }
         }
@@ -3703,6 +4570,9 @@
                 if (typeof console !== 'undefined' && console.info) {
                     console.info('[escpos] target', target.transport, target.label || target.id, 'open=', !!(target.port && (target.port.readable || target.port.writable)));
                 }
+                if (target.transport === 'os') {
+                    throw new Error('OS_PRINT');
+                }
                 if (target.transport === 'bluetooth' || target.transport === 'tcp') {
                     if (supportsNativePrinter()) {
                         await printViaNative(target, concatBytes(parts));
@@ -3713,7 +4583,7 @@
                         return;
                     }
                     if (target.transport === 'tcp') {
-                        throw new Error('LAN/TCP 印刷は Android アプリでのみ利用できます');
+                        throw new Error('LAN_BROWSER');
                     }
                     throw new Error('このブラウザでは Bluetooth 印刷に対応していません。PC の Chrome / Edge で「Bluetooth を追加」するか、Android の Staff アプリを使ってください。');
                 }
@@ -3744,6 +4614,7 @@
 
     P.DEFAULT_PRINTER_KEY = DEFAULT_PRINTER_KEY;
     P.SERIAL_PACE_KEY = PACE_KEY;
+    P.sliceEscPosAtCommands = sliceEscPosAtCommands;
     P.BUFFER_PRESETS = BUFFER_PRESETS;
     P.PACE_MS_PRESETS = PACE_MS_PRESETS;
     P.describeSerialPace = describeSerialPace;
@@ -3873,12 +4744,22 @@
         var data = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
         var rows = [];
         var i = 0;
+        var pendingBand = 0;
+        var lineSpacing = 24;
 
         function blank(count) {
             var n = Math.max(0, count | 0);
             var r;
             for (r = 0; r < n; r += 1) {
                 rows.push(new Uint8Array(width));
+            }
+        }
+
+        function consumeFeed(dots) {
+            var extra = (dots | 0) - pendingBand;
+            pendingBand = 0;
+            if (extra > 0) {
+                blank(extra);
             }
         }
 
@@ -3907,28 +4788,42 @@
                         }
                     }
                 }
+                pendingBand = bandH;
                 continue;
             }
             if (b === 0x1b && i + 1 < data.length && data[i + 1] === 0x40) {
+                pendingBand = 0;
                 i += 2;
                 continue;
             }
+            if (b === 0x1b && i + 1 < data.length && data[i + 1] === 0x32) {
+                lineSpacing = 24;
+                i += 2;
+                continue;
+            }
+            if (b === 0x1b && i + 2 < data.length && data[i + 1] === 0x33) {
+                lineSpacing = data[i + 2] | 0;
+                i += 3;
+                continue;
+            }
             if (b === 0x1b && i + 2 < data.length && data[i + 1] === 0x4a) {
-                blank(data[i + 2]);
+                consumeFeed(data[i + 2]);
                 i += 3;
                 continue;
             }
             if (b === 0x1b && i + 2 < data.length && data[i + 1] === 0x64) {
+                pendingBand = 0;
                 blank((data[i + 2] | 0) * 24);
                 i += 3;
                 continue;
             }
             if (b === 0x1d && i + 1 < data.length && data[i + 1] === 0x56) {
+                pendingBand = 0;
                 i += (i + 2 < data.length && data[i + 2] >= 65) ? 4 : 3;
                 continue;
             }
             if (b === 0x0a || b === 0x0d) {
-                blank(24);
+                consumeFeed(lineSpacing);
                 i += 1;
                 continue;
             }
@@ -4129,7 +5024,7 @@
     }
 
     function shouldFallbackToOsPrint(err, ctx) {
-        if (ctx && (ctx.calibrate || ctx.keepBursts || ctx.mode === 'windows-driver')) {
+        if (ctx && (ctx.calibrate || ctx.keepBursts || ctx.kitchenTicket || ctx.mode === 'windows-driver')) {
             return false;
         }
         if (typeof P.isNativePlatform === 'function' && P.isNativePlatform()) {
@@ -4181,7 +5076,48 @@
         await postLanXml(url, xml, 'text/xml; charset=utf-8');
     }
 
+    async function printBrowserLan(target, bytesOrParts, ctx) {
+        var host = String(target && target.host || '').trim();
+        var port = Number(target && target.port) || 9100;
+        var bytes = partsToBytes(bytesOrParts);
+        if (host) {
+            var base = 'http://' + host;
+            if (port && port !== 80 && port !== 9100) {
+                base += ':' + port;
+            }
+            try {
+                await printViaStarLan(bytes, normalizeLanUrl(base, 'star'));
+                return;
+            } catch (_star) {
+                try {
+                    await printViaEpsonLan(bytes, normalizeLanUrl(base, 'epson'));
+                    return;
+                } catch (_epson) {
+                    /* HTTPS のページから LAN の http へ届かない。Windows の一覧へ。 */
+                }
+            }
+        }
+        if (ctx && ctx.kitchenTicket) {
+            throw new Error('LAN プリンタに届きませんでした。厨房モードでは確認画面を開きません。');
+        }
+        if (typeof console !== 'undefined' && console.info) {
+            console.info('[escpos] PC LAN uses Windows print dialog', host, port);
+        }
+        return printViaWindowsDriver(bytesOrParts);
+    }
+
     async function printOfficialReceipt(bytesOrParts, ctx) {
+        var saved = typeof P.getDefaultPrinter === 'function' ? P.getDefaultPrinter() : null;
+        var native = typeof P.supportsNativePrinter === 'function' && P.supportsNativePrinter();
+        if (ctx && ctx.kitchenTicket && (!saved || saved.transport === 'os')) {
+            throw new Error('厨房モードでは、確認画面が出ないプリンタを選んでください。');
+        }
+        if (saved && saved.transport === 'os') {
+            return printViaWindowsDriver(bytesOrParts);
+        }
+        if (saved && saved.transport === 'tcp' && !native) {
+            return printBrowserLan(saved, bytesOrParts, ctx);
+        }
         var info = getActivePrintPath(ctx);
         if (typeof console !== 'undefined' && console.info) {
             console.info('[escpos] driver=', info.mode, 'path=', info.path, info.url || '');
@@ -4189,11 +5125,15 @@
         var mode = info.mode;
         if (mode === 'windows-driver') {
             var def = typeof P.getDefaultPrinter === 'function' ? P.getDefaultPrinter() : null;
-            if (def && (def.transport === 'usb' || def.transport === 'serial' || def.transport === 'bluetooth')) {
+            if (def && (def.transport === 'usb' || def.transport === 'serial' || def.transport === 'bluetooth'
+                || (ctx && ctx.kitchenTicket && def.transport === 'tcp'))) {
                 if (typeof console !== 'undefined' && console.info) {
                     console.info('[escpos] windows-driver skipped; default ESC/POS printer is set');
                 }
                 return sendManual(bytesOrParts, ctx);
+            }
+            if (ctx && ctx.kitchenTicket) {
+                throw new Error('厨房モードでは、確認画面が出ないプリンタを選んでください。');
             }
             return printViaWindowsDriver(bytesOrParts);
         }
@@ -4214,6 +5154,14 @@
         try {
             return await sendManual(bytesOrParts, ctx);
         } catch (err) {
+            var msg = String(err && err.message ? err.message : err || '');
+            if (msg === 'LAN_BROWSER') {
+                var lan = typeof P.getDefaultPrinter === 'function' ? P.getDefaultPrinter() : null;
+                return printBrowserLan(lan || {}, bytesOrParts);
+            }
+            if (msg === 'OS_PRINT') {
+                return printViaWindowsDriver(bytesOrParts);
+            }
             if (shouldFallbackToOsPrint(err, ctx)) {
                 if (typeof console !== 'undefined' && console.info) {
                     console.info('[escpos] mobile fallback to OS print dialog');
@@ -4308,6 +5256,9 @@
         describeSerialPace: P.describeSerialPace,
         resetSerialPace: P.resetSerialPace,
         setManualBufferPace: P.setManualBufferPace,
+        listRasterFeedModes: P.listRasterFeedModes,
+        getRasterFeedMode: P.getRasterFeedMode,
+        setRasterFeedMode: P.setRasterFeedMode,
         applyShopPrinterSettings: P.applyShopPrinterSettings,
         exportShopPrinterSettings: P.exportShopPrinterSettings,
         getManualBufferBytes: P.getManualBufferBytes,
@@ -4324,7 +5275,10 @@
         buildCheckoutReceiptPayload: P.buildCheckoutReceiptPayload,
         buildOfficialReceiptParts: P.buildOfficialReceiptParts,
         buildOfficialReceiptBytes: P.buildOfficialReceiptBytes,
+        buildFormalReceiptParts: P.buildFormalReceiptParts,
+        buildFormalReceiptBytes: P.buildFormalReceiptBytes,
         buildPrinterLoadTestParts: P.buildPrinterLoadTestParts,
+        buildOrderTicketParts: P.buildOrderTicketParts,
         renderBannerEscStar: P.renderBannerEscStar,
         downloadReceiptBytes: P.downloadReceiptBytes,
         isNativePlatform: P.isNativePlatform,

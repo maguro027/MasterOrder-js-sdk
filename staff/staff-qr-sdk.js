@@ -7,8 +7,109 @@
 (function (global) {
     'use strict';
 
-    var SDK_VERSION = '1.1.1';
+    var SDK_VERSION = '1.2.0';
     var DEFAULT_QR_PX = 184;
+    var QR_EXPORT_SIZE_MIN = 128;
+    var QR_EXPORT_SIZE_MAX = 4096;
+    var QR_EXPORT_MARGIN_MAX = 1024;
+    var QR_EXPORT_CANVAS_MAX = 4096;
+    var QR_EXPORT_DEFAULT_SIZE = 1024;
+    var QR_EXPORT_DEFAULT_MARGIN = 48;
+
+    function clampQrExportInt(value, min, max, fallback) {
+        var n = Math.round(Number(value));
+        if (!Number.isFinite(n)) {
+            return fallback;
+        }
+        if (n < min) {
+            return min;
+        }
+        if (n > max) {
+            return max;
+        }
+        return n;
+    }
+
+    /**
+     * 保存画像の QR 本体サイズと周囲の白余白。
+     * 一辺は端末の canvas 上限に収まるよう余白側から詰める。
+     */
+    function normalizeQrExportOptions(options) {
+        options = options || {};
+        var sizePx = clampQrExportInt(
+            options.sizePx,
+            QR_EXPORT_SIZE_MIN,
+            QR_EXPORT_SIZE_MAX,
+            QR_EXPORT_DEFAULT_SIZE
+        );
+        var marginRoom = Math.floor((QR_EXPORT_CANVAS_MAX - sizePx) / 2);
+        if (marginRoom < 0) {
+            marginRoom = 0;
+        }
+        var marginCap = Math.min(QR_EXPORT_MARGIN_MAX, Math.floor(sizePx / 2), marginRoom);
+        var marginFallback = QR_EXPORT_DEFAULT_MARGIN > marginCap
+            ? marginCap
+            : QR_EXPORT_DEFAULT_MARGIN;
+        var marginPx = clampQrExportInt(options.marginPx, 0, marginCap, marginFallback);
+        return {
+            sizePx: sizePx,
+            marginPx: marginPx,
+            canvasPx: sizePx + (marginPx * 2)
+        };
+    }
+
+    function qrExportFilename(tableNo, kind) {
+        var n = Math.round(Number(tableNo || 0));
+        var suffix = kind === 'session' ? 'session-qr' : 'qr';
+        if (n > 0) {
+            return 'table-' + n + '-' + suffix + '.png';
+        }
+        return suffix + '.png';
+    }
+
+    function dataUrlToBlob(dataUrl) {
+        var raw = String(dataUrl || '');
+        var comma = raw.indexOf(',');
+        if (comma < 0) {
+            return null;
+        }
+        var meta = raw.slice(0, comma);
+        var body = raw.slice(comma + 1);
+        var mimeMatch = meta.match(/data:([^;]+)/);
+        var mime = mimeMatch ? mimeMatch[1] : 'image/png';
+        var binary;
+        try {
+            binary = atob(body);
+        } catch (_err) {
+            return null;
+        }
+        var len = binary.length;
+        var bytes = new Uint8Array(len);
+        var i;
+        for (i = 0; i < len; i += 1) {
+            bytes[i] = binary.charCodeAt(i);
+        }
+        return new Blob([bytes], { type: mime });
+    }
+
+    function prefersQrShareSheet() {
+        var nav = global.navigator;
+        if (!nav) {
+            return false;
+        }
+        if (global.Capacitor
+                && typeof global.Capacitor.isNativePlatform === 'function'
+                && global.Capacitor.isNativePlatform()) {
+            return true;
+        }
+        var ua = String(nav.userAgent || '');
+        if (/Android|iPhone|iPad|iPod/i.test(ua)) {
+            return true;
+        }
+        return nav.maxTouchPoints > 1
+            && typeof global.matchMedia === 'function'
+            && global.matchMedia('(pointer: coarse)').matches;
+    }
 
     function resolveCardPassPhrase(card) {
         var kitei = global.MasterOrderStaffKiteiSdk;
@@ -65,6 +166,13 @@
         return '';
     }
 
+    function isGuestShareJoinPathname(pathname) {
+        var parts = String(pathname || '/').split('/').filter(Boolean);
+        return parts.length >= 3
+            && String(parts[0]).toLowerCase() === 'shop'
+            && String(parts[2]).toLowerCase() === 'share';
+    }
+
     function staffQrShopMatches(scannedSlug, currentSlug) {
         var scanned = displayPathSlug(scannedSlug);
         var current = displayPathSlug(currentSlug);
@@ -112,7 +220,8 @@
             }
         }
         var passPhrase = param('passPhrase');
-        if (tableNo > 0 && passPhrase) {
+        var sharePath = parsed && isGuestShareJoinPathname(parsed.pathname);
+        if (!sharePath && tableNo > 0 && passPhrase) {
             return {
                 kind: 'fixed',
                 tableNo: tableNo,
@@ -153,9 +262,9 @@
         return null;
     }
 
-    function tableQrToDataUrl(tableEl, width, height) {
+    function tableQrToCanvas(tableEl, width, height) {
         if (!tableEl || !tableEl.rows || !tableEl.rows.length) {
-            return '';
+            return null;
         }
         var rows = tableEl.rows;
         var nRow = rows.length;
@@ -164,6 +273,9 @@
         canvas.width = width;
         canvas.height = height;
         var ctx = canvas.getContext('2d');
+        if (!ctx) {
+            return null;
+        }
         var cw = width / nCol;
         var ch = height / nRow;
         var r;
@@ -178,11 +290,26 @@
                 ctx.fillRect(Math.floor(c * cw), Math.floor(r * ch), Math.ceil(cw), Math.ceil(ch));
             }
         }
-        try {
-            return canvas.toDataURL('image/png');
-        } catch (e) {
+        return canvas;
+    }
+
+    function canvasToPngDataUrl(canvas) {
+        if (!canvas || canvas.width <= 0 || canvas.height <= 0) {
             return '';
         }
+        try {
+            var url = canvas.toDataURL('image/png');
+            if (url && url.length > 64) {
+                return url;
+            }
+        } catch (_err) {
+            return '';
+        }
+        return '';
+    }
+
+    function tableQrToDataUrl(tableEl, width, height) {
+        return canvasToPngDataUrl(tableQrToCanvas(tableEl, width, height));
     }
 
     function createSimpleSet() {
@@ -234,6 +361,22 @@
         var qrPx = options.qrPx > 0 ? options.qrPx : DEFAULT_QR_PX;
 
         var sessionQrCache = createSimpleMap();
+        var exportTextByImg = typeof WeakMap === 'function' ? new WeakMap() : null;
+
+        function rememberExportText(imgEl, text) {
+            var payload = String(text || '').trim();
+            if (!imgEl || !payload || !exportTextByImg) {
+                return;
+            }
+            exportTextByImg.set(imgEl, payload);
+        }
+
+        function readExportText(imgEl) {
+            if (!imgEl || !exportTextByImg || !exportTextByImg.has(imgEl)) {
+                return '';
+            }
+            return String(exportTextByImg.get(imgEl) || '');
+        }
 
         var sessionCardQrLoadQueue = [];
         var sessionCardQrQueuedKeys = createSimpleSet();
@@ -272,14 +415,27 @@
             return GUEST_SHOP_PATH_PREFIX + '/' + encodeURIComponent(slug) + '/';
         }
 
-        function buildShopScopedGuestUrl(shopSlug, sessionId, entryPin) {
+        function buildShopScopedGuestSharePath(shopSlug) {
             var path = buildShopScopedGuestPath(shopSlug);
-            if (!path || !sessionId || !entryPin) {
-                return path;
+            if (!path) {
+                return '';
+            }
+            return path.replace(/\/+$/, '') + '/share/';
+        }
+
+        function buildShopScopedGuestUrl(shopSlug, sessionId, entryPin) {
+            var sid = String(sessionId || '').trim();
+            var pin = String(entryPin || '').trim().toUpperCase();
+            if (!sid || !pin) {
+                return buildShopScopedGuestPath(shopSlug);
+            }
+            var path = buildShopScopedGuestSharePath(shopSlug);
+            if (!path) {
+                return '';
             }
             var params = new URLSearchParams();
-            params.set('id', String(sessionId).trim());
-            params.set('pass', String(entryPin).trim().toUpperCase());
+            params.set('id', sid);
+            params.set('pass', pin);
             return path + '?' + params.toString();
         }
 
@@ -311,7 +467,7 @@
             if (token) {
                 var joinParams = new URLSearchParams();
                 joinParams.set('join', token);
-                return base.replace(/\/$/, '') + buildShopScopedGuestPath(shopSlug) + '?' + joinParams.toString();
+                return base.replace(/\/$/, '') + buildShopScopedGuestSharePath(shopSlug) + '?' + joinParams.toString();
             }
             return base.replace(/\/$/, '') + buildShopScopedGuestPath(shopSlug);
         }
@@ -390,44 +546,46 @@
             return 0;
         }
 
-        function extractQrDataUrlFromHolder(holder) {
+        function detachQrCanvas(canvas) {
+            if (!canvas || canvas.width <= 0 || canvas.height <= 0) {
+                return null;
+            }
+            var clone = document.createElement('canvas');
+            clone.width = canvas.width;
+            clone.height = canvas.height;
+            var ctx = clone.getContext('2d');
+            if (!ctx) {
+                return null;
+            }
+            ctx.drawImage(canvas, 0, 0);
+            return clone;
+        }
+
+        function extractQrCanvasFromHolder(holder, pixelSize) {
             if (!holder) {
-                return '';
+                return null;
             }
             var canvas = holder.querySelector('canvas');
             if (canvas && canvas.width > 0 && canvas.height > 0) {
-                try {
-                    var fromCanvas = canvas.toDataURL('image/png');
-                    if (fromCanvas && fromCanvas.length > 64) {
-                        return fromCanvas;
-                    }
-                } catch (_canvasErr) {
-                    /* fall through */
-                }
+                return detachQrCanvas(canvas);
             }
             var tableEl = holder.querySelector('table');
             if (tableEl) {
-                var fromTable = tableQrToDataUrl(tableEl, qrPx, qrPx);
-                if (fromTable && fromTable.length > 64) {
-                    return fromTable;
-                }
+                return tableQrToCanvas(tableEl, pixelSize, pixelSize);
             }
-            var innerImg = holder.querySelector('img');
-            if (innerImg && innerImg.src && innerImg.src.indexOf('data:image') === 0 && innerImg.src.length > 64) {
-                return innerImg.src;
-            }
-            return '';
+            return null;
         }
 
-        function createQrRenderHolder() {
+        function createQrRenderHolder(pixelSize) {
+            var size = pixelSize > 0 ? pixelSize : qrPx;
             var holder = document.createElement('div');
             holder.setAttribute('aria-hidden', 'true');
-            holder.style.cssText = 'position:fixed;left:-10000px;top:0;width:' + qrPx + 'px;height:'
-                + qrPx + 'px;overflow:hidden;opacity:0;pointer-events:none;';
+            holder.style.cssText = 'position:fixed;left:-10000px;top:0;width:' + size + 'px;height:'
+                + size + 'px;overflow:hidden;opacity:0;pointer-events:none;';
             return holder;
         }
 
-        function renderQrIntoHolder(holder, QRCodeLib, qrOptions, forceTableMode) {
+        function paintQrIntoHolder(holder, QRCodeLib, qrOptions, forceTableMode) {
             var savedCtx = global.CanvasRenderingContext2D;
             if (forceTableMode && savedCtx) {
                 try {
@@ -438,7 +596,6 @@
             }
             try {
                 new QRCodeLib(holder, qrOptions);
-                return extractQrDataUrlFromHolder(holder);
             } finally {
                 if (forceTableMode && savedCtx) {
                     global.CanvasRenderingContext2D = savedCtx;
@@ -446,45 +603,144 @@
             }
         }
 
-        function generateQrDataUrlFromText(text) {
+        function generateQrCanvasFromText(text, pixelSize) {
             var QRCodeLib = global.QRCode;
             var payload = String(text || '').trim();
-            if (!payload || typeof QRCodeLib !== 'function') {
-                return '';
+            var size = pixelSize > 0 ? pixelSize : qrPx;
+            if (!payload || typeof QRCodeLib !== 'function' || !document.body) {
+                return null;
             }
             var qrOptions = {
                 text: payload,
-                width: qrPx,
-                height: qrPx,
+                width: size,
+                height: size,
                 colorDark: '#000000',
                 colorLight: '#ffffff',
                 correctLevel: resolveQrCorrectLevel(QRCodeLib)
             };
-            var holder = createQrRenderHolder();
+            var holder = createQrRenderHolder(size);
             document.body.appendChild(holder);
-            var dataUrl = '';
+            var canvas = null;
             try {
-                dataUrl = renderQrIntoHolder(holder, QRCodeLib, qrOptions, true);
-                if (!dataUrl) {
+                paintQrIntoHolder(holder, QRCodeLib, qrOptions, true);
+                canvas = extractQrCanvasFromHolder(holder, size);
+                if (!canvas) {
                     holder.replaceChildren();
-                    dataUrl = renderQrIntoHolder(holder, QRCodeLib, qrOptions, false);
+                    paintQrIntoHolder(holder, QRCodeLib, qrOptions, false);
+                    canvas = extractQrCanvasFromHolder(holder, size);
                 }
             } catch (_qrErr) {
-                dataUrl = '';
+                canvas = null;
             } finally {
                 holder.remove();
             }
-            return dataUrl;
+            return canvas;
+        }
+
+        function generateQrDataUrlFromText(text, pixelSize) {
+            var canvas = generateQrCanvasFromText(text, pixelSize);
+            var fromCanvas = canvasToPngDataUrl(canvas);
+            if (fromCanvas) {
+                return fromCanvas;
+            }
+            return '';
+        }
+
+        function composeQrExportDataUrl(text, exportOptions) {
+            var spec = normalizeQrExportOptions(exportOptions);
+            var qrCanvas = generateQrCanvasFromText(text, spec.sizePx);
+            if (!qrCanvas) {
+                return '';
+            }
+            if (spec.marginPx <= 0) {
+                return canvasToPngDataUrl(qrCanvas);
+            }
+            var out = document.createElement('canvas');
+            out.width = spec.canvasPx;
+            out.height = spec.canvasPx;
+            var ctx = out.getContext('2d');
+            if (!ctx) {
+                return '';
+            }
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(0, 0, out.width, out.height);
+            ctx.imageSmoothingEnabled = false;
+            ctx.drawImage(qrCanvas, spec.marginPx, spec.marginPx, spec.sizePx, spec.sizePx);
+            return canvasToPngDataUrl(out);
+        }
+
+        function downloadQrBlob(blob, filename) {
+            var url = URL.createObjectURL(blob);
+            try {
+                var a = document.createElement('a');
+                a.href = url;
+                a.download = filename;
+                a.rel = 'noopener';
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+            } finally {
+                global.setTimeout(function () {
+                    try {
+                        URL.revokeObjectURL(url);
+                    } catch (_ignored) {
+                        /* ignore */
+                    }
+                }, 1500);
+            }
+        }
+
+        function saveQrPng(dataUrl, filename) {
+            var name = filename || 'qr.png';
+            var blob = dataUrlToBlob(dataUrl);
+            if (!blob) {
+                return Promise.resolve('failed');
+            }
+            var nav = global.navigator;
+            var file = null;
+            try {
+                file = new File([blob], name, { type: 'image/png' });
+            } catch (_fileErr) {
+                file = null;
+            }
+            function afterDownload() {
+                return prefersQrShareSheet() ? 'needs-preview' : 'downloaded';
+            }
+            if (file && prefersQrShareSheet() && nav
+                    && typeof nav.canShare === 'function'
+                    && typeof nav.share === 'function'
+                    && nav.canShare({ files: [file] })) {
+                return nav.share({ files: [file], title: name.replace(/\.png$/i, '') }).then(function () {
+                    return 'shared';
+                }).catch(function (err) {
+                    if (err && err.name === 'AbortError') {
+                        return 'cancelled';
+                    }
+                    try {
+                        downloadQrBlob(blob, name);
+                    } catch (_dlErr) {
+                        return 'needs-preview';
+                    }
+                    return 'needs-preview';
+                });
+            }
+            try {
+                downloadQrBlob(blob, name);
+            } catch (_dlErr) {
+                return Promise.resolve(prefersQrShareSheet() ? 'needs-preview' : 'failed');
+            }
+            return Promise.resolve(afterDownload());
         }
 
         function generateSessionQrDataUrl(url) {
             return generateQrDataUrlFromText(url);
         }
 
-        function applySessionQrToElements(imgEl, captionEl, dataUrl) {
+        function applySessionQrToElements(imgEl, captionEl, dataUrl, exportText) {
             if (!imgEl || !dataUrl) {
                 return false;
             }
+            rememberExportText(imgEl, exportText);
             imgEl.src = dataUrl;
             imgEl.style.display = '';
             imgEl.style.visibility = '';
@@ -505,12 +761,12 @@
             }
             var cacheKey = job.cacheKey || sessionQrCacheKey(job.sessionId, job.entryPin);
             if (sessionQrCache.has(cacheKey)) {
-                applySessionQrToElements(job.imgEl, job.captionEl, sessionQrCache.get(cacheKey));
+                applySessionQrToElements(job.imgEl, job.captionEl, sessionQrCache.get(cacheKey), job.url);
                 return;
             }
             if (sessionCardQrQueuedKeys.has(cacheKey)) {
                 if (sessionQrCache.has(cacheKey)) {
-                    applySessionQrToElements(job.imgEl, job.captionEl, sessionQrCache.get(cacheKey));
+                    applySessionQrToElements(job.imgEl, job.captionEl, sessionQrCache.get(cacheKey), job.url);
                 }
                 return;
             }
@@ -588,7 +844,7 @@
                         }
                         return;
                     }
-                    applySessionQrToElements(next.imgEl, next.captionEl, dataUrl);
+                    applySessionQrToElements(next.imgEl, next.captionEl, dataUrl, next.url);
                 }
 
                 if (typeof global.requestIdleCallback === 'function') {
@@ -617,6 +873,8 @@
         }
 
         function applyFixedQrToWrap(qrWrap, qrImg, qrCaption, tableNo, passPhrase, connectUrl) {
+            var exportUrl = String(connectUrl || '').trim() || buildFixedQrConnectUrl(tableNo, passPhrase);
+            rememberExportText(qrImg, exportUrl);
             var cacheKey = fixedQrCacheKey(tableNo, passPhrase, connectUrl);
             var dataUrl = sessionQrCache.get(cacheKey);
             if (!dataUrl) {
@@ -873,7 +1131,7 @@
             var cacheKey = sessionQrCacheKey(sessionId, entryPin);
             var cachedDataUrl = sessionQrCache.get(cacheKey);
             if (cachedDataUrl) {
-                return applySessionQrToElements(imgEl, captionEl, cachedDataUrl);
+                return applySessionQrToElements(imgEl, captionEl, cachedDataUrl, url);
             }
             if (options.immediate === true) {
                 var immediateDataUrl = generateSessionQrDataUrl(url);
@@ -890,7 +1148,7 @@
                     return false;
                 }
                 sessionQrCache.set(cacheKey, immediateDataUrl);
-                return applySessionQrToElements(imgEl, captionEl, immediateDataUrl);
+                return applySessionQrToElements(imgEl, captionEl, immediateDataUrl, url);
             }
             imgEl.style.visibility = 'hidden';
             if (captionEl) {
@@ -917,6 +1175,8 @@
                 applyFixedQrToWrap(qrWrap, imgEl, captionEl, tableNo, passPhrase, connectUrl);
                 return;
             }
+            var exportUrl = String(connectUrl || '').trim() || buildFixedQrConnectUrl(tableNo, passPhrase);
+            rememberExportText(imgEl, exportUrl);
             var cacheKey = fixedQrCacheKey(tableNo, passPhrase, connectUrl);
             var cachedDataUrl = sessionQrCache.get(cacheKey);
             if (cachedDataUrl) {
@@ -959,15 +1219,22 @@
             finalizeTableSeatQrLoads: finalizeTableSeatQrLoads,
             stopSessionCardQrLoads: stopSessionCardQrLoads,
             stopLazyFixedQrLoads: stopLazyFixedQrLoads,
-            hideQrLoadingOverlay: hideQrLoadingOverlay
+            hideQrLoadingOverlay: hideQrLoadingOverlay,
+            readExportText: readExportText,
+            composeQrExportDataUrl: composeQrExportDataUrl,
+            saveQrPng: saveQrPng
         };
     }
 
     global.MasterOrderStaffQrSdk = {
         VERSION: SDK_VERSION,
         DEFAULT_QR_PX: DEFAULT_QR_PX,
+        QR_EXPORT_DEFAULT_SIZE: QR_EXPORT_DEFAULT_SIZE,
+        QR_EXPORT_DEFAULT_MARGIN: QR_EXPORT_DEFAULT_MARGIN,
         createStaffQrService: createStaffQrService,
         tableQrToDataUrl: tableQrToDataUrl,
+        normalizeQrExportOptions: normalizeQrExportOptions,
+        qrExportFilename: qrExportFilename,
         parseStaffQrScanText: parseStaffQrScanText,
         parseShopSlugFromGuestPath: parseShopSlugFromGuestPath,
         staffQrShopMatches: staffQrShopMatches

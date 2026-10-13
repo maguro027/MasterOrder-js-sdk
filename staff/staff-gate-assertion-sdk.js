@@ -15,6 +15,47 @@
         return 30;
     }
 
+    /** JWT の exp（秒）。検証はしない。読めなければ 0。 */
+    function firebaseIdTokenExp(token) {
+        try {
+            var parts = String(token || '').split('.');
+            if (parts.length < 2 || !parts[1]) {
+                return 0;
+            }
+            var b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+            while (b64.length % 4) {
+                b64 += '=';
+            }
+            var json = JSON.parse(atob(b64));
+            var exp = Number(json && json.exp);
+            return Number.isFinite(exp) && exp > 0 ? exp : 0;
+        } catch (_e) {
+            return 0;
+        }
+    }
+
+    /** 期限切れ、または skew 秒以内に切れる ID トークンは再取得する。 */
+    function firebaseIdTokenNeedsRefresh(token, withinSeconds) {
+        var skew = withinSeconds == null ? 90 : Number(withinSeconds);
+        if (!Number.isFinite(skew) || skew < 0) {
+            skew = 90;
+        }
+        var exp = firebaseIdTokenExp(token);
+        if (!exp) {
+            return true;
+        }
+        return exp <= Math.floor(Date.now() / 1000) + skew;
+    }
+
+    function isMintAuthRejected(err) {
+        var status = err && Number(err.status);
+        if (status === 401 || status === 403) {
+            return true;
+        }
+        var msg = err && err.message ? String(err.message) : '';
+        return /Gate assertion mint failed:\s*40[13]/.test(msg);
+    }
+
     function resolveFlag(value, windowKey) {
         if (typeof value === 'function') {
             try {
@@ -46,6 +87,8 @@
         var apiBase = String(options.apiBaseUrl || '').replace(/\/$/, '');
         var ttlSeconds = options.ttlSeconds > 0 ? options.ttlSeconds : 300;
 
+        var mintInflight = null;
+
         async function mint(firebaseToken) {
             var routes = global.MasterOrderApiRoutes;
             var gatePath = routes && routes.paths && routes.paths.auth
@@ -68,9 +111,45 @@
                 if (/Just a moment|challenges\.cloudflare\.com|<!DOCTYPE\s+html|<html[\s>]/i.test(body)) {
                     throw new Error('ネットワーク保護の確認に失敗しました。通信環境を変えるか、しばらくしてから再試行してください。');
                 }
-                throw new Error('Gate assertion mint failed: ' + res.status + ' ' + body.slice(0, 200));
+                var err = new Error('Gate assertion mint failed: ' + res.status);
+                err.status = res.status;
+                throw err;
             }
             return res.json();
+        }
+
+        async function mintWithFreshFirebaseToken() {
+            var firebaseToken = await options.getFirebaseIdToken(false);
+            if (!firebaseToken) {
+                return null;
+            }
+            if (firebaseIdTokenNeedsRefresh(firebaseToken, 90)) {
+                firebaseToken = await options.getFirebaseIdToken(true);
+                if (!firebaseToken) {
+                    return null;
+                }
+            }
+            try {
+                return await mint(firebaseToken);
+            } catch (err) {
+                if (!isMintAuthRejected(err)) {
+                    throw err;
+                }
+                var forced = await options.getFirebaseIdToken(true);
+                if (!forced || forced === firebaseToken) {
+                    throw err;
+                }
+                return await mint(forced);
+            }
+        }
+
+        function mintOnce() {
+            if (!mintInflight) {
+                mintInflight = mintWithFreshFirebaseToken().finally(function () {
+                    mintInflight = null;
+                });
+            }
+            return mintInflight;
         }
 
         /**
@@ -80,13 +159,8 @@
         return async function getAccessToken(forceRefresh) {
             var enabled = resolveFlag(options.enabled, '_gateAssertionEnabled');
             var requireAssertion = resolveFlag(options.require, '_gateAssertionRequire');
-            var firebaseToken = await options.getFirebaseIdToken(forceRefresh === true);
-            if (!firebaseToken) {
-                cached = { assertion: null, expiresAt: 0, uid: null };
-                return null;
-            }
             if (!enabled) {
-                return firebaseToken;
+                return options.getFirebaseIdToken(forceRefresh === true);
             }
 
             var uid = typeof options.getAuthUid === 'function' ? options.getAuthUid() : null;
@@ -101,12 +175,12 @@
             }
 
             try {
-                var data = await mint(firebaseToken);
+                var data = await mintOnce();
                 if (!data || !data.assertion) {
                     if (requireAssertion) {
                         throw new Error('Gate assertion mint returned empty assertion');
                     }
-                    return firebaseToken;
+                    return options.getFirebaseIdToken(false);
                 }
                 cached = {
                     assertion: String(data.assertion),
@@ -121,7 +195,7 @@
                 if (typeof console !== 'undefined' && console.warn) {
                     console.warn('[GateAssertion] falling back to Firebase ID token', err);
                 }
-                return firebaseToken;
+                return options.getFirebaseIdToken(true);
             }
         };
     }
@@ -129,6 +203,7 @@
     global.MasterOrderStaffGateAssertionSdk = {
         version: SDK_VERSION,
         createGateAssertionAccessToken: createGateAssertionAccessToken,
+        firebaseIdTokenNeedsRefresh: firebaseIdTokenNeedsRefresh,
         clearCache: function () {
             cached = { assertion: null, expiresAt: 0, uid: null };
         }

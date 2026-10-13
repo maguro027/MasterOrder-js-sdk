@@ -21,5 +21,15 @@ assert.match(
   /params\.set\('id', id\);\s*params\.set\('pass', normalizedPin\);/,
   'explicit share/QR URLs must still carry id/pass',
 );
+assert.match(
+  orderSdk,
+  /function buildShopScopedGuestSharePath[\s\S]*\/share\//,
+  'join URLs must use the /share/ path',
+);
+assert.match(
+  orderSdk,
+  /if \(isGuestShareJoinPath\(locationRef\)\) \{\s*return false;/,
+  'share path must not open a fixed-QR session',
+);
 
 console.log('guest URL credential security contract: OK');

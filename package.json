@@ -13,6 +13,7 @@
   "scripts": {
     "verify": "node scripts/verify-layout.js",
     "test:security": "node scripts/staff-pii-cache-security-contract.mjs && node scripts/guest-url-credential-security-contract.mjs && node scripts/staff-archive-cache-security-contract.mjs",
+    "test:staff-bundle": "node scripts/staff-bundle-contract-test.mjs && node ../scripts/assert-staff-bundle-contract.mjs",
     "test:staff-qr": "node scripts/staff-qr-scan-contract.mjs",
     "test:party-flags": "node scripts/party-flags-contract.mjs",
     "build": "node ../scripts/bundle-order-js.mjs && node ../scripts/bundle-staff-js.mjs",

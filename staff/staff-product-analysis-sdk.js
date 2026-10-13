@@ -15,6 +15,7 @@
     var THEME = {
         grid: 'rgba(255, 255, 255, 0.1)',
         text: '#b4bdc4',
+        title: '#f0f3f5',
         tooltipBg: 'rgba(30, 36, 40, 0.95)',
         tooltipBorder: 'rgba(255, 255, 255, 0.12)',
         accent: '#3ec3ff',
@@ -23,6 +24,18 @@
         danger: '#ea5455',
         purple: '#7367f0'
     };
+
+    function syncProductAnalysisTheme() {
+        var light = typeof document !== 'undefined'
+            && document.documentElement
+            && document.documentElement.getAttribute('data-theme') === 'light';
+        THEME.grid = light ? 'rgba(26, 36, 44, 0.12)' : 'rgba(255, 255, 255, 0.1)';
+        THEME.text = light ? '#4a5c68' : '#b4bdc4';
+        THEME.title = light ? '#1a242c' : '#f0f3f5';
+        THEME.tooltipBg = light ? 'rgba(255, 255, 255, 0.97)' : 'rgba(30, 36, 40, 0.95)';
+        THEME.tooltipBorder = light ? 'rgba(26, 36, 44, 0.14)' : 'rgba(255, 255, 255, 0.12)';
+        THEME.accent = light ? '#0b7ea8' : '#3ec3ff';
+    }
 
     /** Chart.js のぬるっと更新（destroy→再生成を避ける） */
     var CHART_ANIMATION = {
@@ -214,7 +227,7 @@
         return {
             enabled: true,
             backgroundColor: THEME.tooltipBg,
-            titleColor: '#f0f3f5',
+            titleColor: THEME.title || THEME.text,
             bodyColor: THEME.text,
             borderColor: THEME.tooltipBorder,
             borderWidth: 1,
@@ -923,6 +936,7 @@
     }
 
     function createProductAnalysisCharts(options) {
+        syncProductAnalysisTheme();
         var opts = options || {};
         var Chart = opts.Chart || global.Chart;
         var charts = {
@@ -1934,6 +1948,7 @@
         }
 
         function render(snapshot, hosts) {
+            syncProductAnalysisTheme();
             var h = hosts || {};
             renderKpi(h.kpiCard, snapshot);
             if (h.hourlyTitle) {

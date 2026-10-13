@@ -15,7 +15,7 @@
 | `staff-kitei-table-sdk.js` | `MasterOrderStaffKiteiSdk` | 固定 QR 卓カード |
 | `staff-dashboard-sdk.js` | `MasterOrderStaffDashboardSdk` | Chart.js ダッシュボード |
 | `staff-notifications-sdk.js` | — | 通知 |
-| `staff-email-auth-sdk.js` | — | メール認証 |
+| `staff-email-auth-sdk.js` | `MasterOrderStaffEmailAuthSdk` | メール認証 |
 | `staff-user-sdk.js` | — | プロフィール・トップバー |
 | `staff-inventory-sdk.js` | — | 在庫入力 |
 | `staff-escpos-sdk.js` | `MasterOrderStaffEscPosSdk` | **生成物。** 実体は [`js-sdk/printer/`](../printer/README.md) の IIFE |

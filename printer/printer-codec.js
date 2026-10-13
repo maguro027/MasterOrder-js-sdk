@@ -6,11 +6,19 @@
     'use strict';
 
     var P = global.MasterOrderPrinter || (global.MasterOrderPrinter = {});
-    var SDK_VERSION = '1.1.5';
+    var SDK_VERSION = '1.1.10';
     var RECEIPT_DOT_WIDTH = 384;
     var IMAGE_LINE_HEIGHT = 48;
     /** ESC * 24-dot バンド高さ。紙送りもこのドット数に合わせる。 */
     var ESC_STAR_BAND_DOTS = 24;
+    /** この端末だけ。店舗プロフィールには出さない（58E と新型が同居する）。 */
+    var RASTER_FEED_KEY = 'mo.staff.rasterFeed';
+    /** 行間を帯の高さにして LF を 1 回。既定。行間 0 だと反転した同じ行を足す機種がある。 */
+    var RASTER_FEED_TIGHT = 'tight';
+    /** 行間 0 のあと ESC J 24。行間 0 を無視せず、帯のあと既定行間を足す機種向け。 */
+    var RASTER_FEED_ZERO = 'zero';
+    var RASTER_FEED_ESC_J = 'esc-j';
+    var RASTER_FEED_NATIVE = 'native';
 
     var ESC = 0x1b;
     var GS = 0x1d;
@@ -50,6 +58,77 @@
     function cmdFeedDots(dots) {
         var n = Math.max(0, Math.min(255, dots | 0));
         return new Uint8Array([ESC, 0x4a, n]);
+    }
+
+    /** LF — いまの行間だけ紙を送る。帯の高さに合わせてから出す。 */
+    function cmdLineFeed() {
+        return new Uint8Array([0x0a]);
+    }
+
+    /** ESC 3 n — 行間を n ドットにする。0 は帯の直後に反転行を足す機種がある。 */
+    function cmdSetLineSpacing(dots) {
+        var n = Math.max(0, Math.min(255, dots | 0));
+        return new Uint8Array([ESC, 0x33, n]);
+    }
+
+    /** ESC 2 — 行間をプリンタ既定へ戻す。戻さないと ESC d の空行が潰れる。 */
+    function cmdDefaultLineSpacing() {
+        return new Uint8Array([ESC, 0x32]);
+    }
+
+    function listRasterFeedModes() {
+        return [
+            {
+                id: RASTER_FEED_TIGHT,
+                label: '余白を詰める',
+                note: '行間を帯の高さ（24ドット）にしてから改行する。行の直後に上下反転した同じ行が出る機種向け。'
+            },
+            {
+                id: RASTER_FEED_ZERO,
+                label: '行間ゼロ',
+                note: '帯の前に行間を 0 にしてから 24 ドット送る。詰めても帯のあいだに白い行が残る機種向け。反転行が出たら余白を詰めるに戻す。'
+            },
+            {
+                id: RASTER_FEED_ESC_J,
+                label: '58E 互換',
+                note: '行間は触らず、各帯のあと 24 ドット送る。帯が重なる機種向け。'
+            },
+            {
+                id: RASTER_FEED_NATIVE,
+                label: 'プリンタに任せる',
+                note: '行間を帯の高さにして、帯のあと紙送りを出さない。改行しても反転行が残る機種向け。重なるときは 58E 互換に戻す。'
+            }
+        ];
+    }
+
+    function normalizeRasterFeedMode(mode) {
+        var id = String(mode || '');
+        if (id === RASTER_FEED_ESC_J || id === RASTER_FEED_NATIVE
+            || id === RASTER_FEED_TIGHT || id === RASTER_FEED_ZERO) {
+            return id;
+        }
+        return RASTER_FEED_TIGHT;
+    }
+
+    function getRasterFeedMode() {
+        try {
+            var raw = global.localStorage && global.localStorage.getItem(RASTER_FEED_KEY);
+            return normalizeRasterFeedMode(raw);
+        } catch (_e) {
+            return RASTER_FEED_TIGHT;
+        }
+    }
+
+    function setRasterFeedMode(mode) {
+        var id = normalizeRasterFeedMode(mode);
+        if (String(mode || '') !== id && mode != null && String(mode) !== '') {
+            throw new Error('未知の画像紙送りです');
+        }
+        if (!global.localStorage) {
+            throw new Error('このブラウザではプリンタ設定を保存できません');
+        }
+        global.localStorage.setItem(RASTER_FEED_KEY, id);
+        return id;
     }
 
     function cmdCut() {
@@ -438,6 +517,170 @@
         return src;
     }
 
+    function receiptLuma(r, g, b) {
+        return (r * 3 + g * 4 + b) >> 3;
+    }
+
+    function blankImageData(width, height) {
+        if (typeof ImageData !== 'undefined') {
+            return new ImageData(width, height);
+        }
+        return {
+            width: width,
+            height: height,
+            data: new Uint8ClampedArray(width * height * 4)
+        };
+    }
+
+    function pixelChroma(r, g, b) {
+        var max = r > g ? r : g;
+        if (b > max) {
+            max = b;
+        }
+        var min = r < g ? r : g;
+        if (b < min) {
+            min = b;
+        }
+        return max - min;
+    }
+
+    function medianLuma(values) {
+        if (!values.length) {
+            return 255;
+        }
+        var copy = values.slice().sort(function (a, b) {
+            return a - b;
+        });
+        return copy[copy.length >> 1];
+    }
+
+    /**
+     * ロゴの紙は白のまま残す。枠が暗い JPEG（透過を黒く潰したロゴ）は、
+     * 無彩色の暗部だけ紙に戻す。白い図形が残ったら反転して黒インクにする。
+     * 全面がまだ黒なら null（黒帯はヘッドを止めるので送らない）。
+     * @returns {ImageData|null}
+     */
+    function prepareReceiptBannerImageData(imageData, rect) {
+        var width = imageData.width;
+        var height = imageData.height;
+        var src = imageData.data;
+        var x0 = rect && rect.x != null ? Math.max(0, rect.x | 0) : 0;
+        var y0 = rect && rect.y != null ? Math.max(0, rect.y | 0) : 0;
+        var x1 = rect && rect.w != null ? Math.min(width, x0 + (rect.w | 0)) : width;
+        var y1 = rect && rect.h != null ? Math.min(height, y0 + (rect.h | 0)) : height;
+        if (x1 <= x0 || y1 <= y0) {
+            return null;
+        }
+        var border = [];
+        var y;
+        var x;
+        var i;
+        var luma;
+        var chroma;
+        var edge = 3;
+        for (y = y0; y < y1; y += 1) {
+            for (x = x0; x < x1; x += 1) {
+                var onBorder = x < x0 + edge || x >= x1 - edge || y < y0 + edge || y >= y1 - edge;
+                if (!onBorder) {
+                    continue;
+                }
+                i = (y * width + x) * 4;
+                if (src[i + 3] < 128) {
+                    border.push(255);
+                    continue;
+                }
+                border.push(receiptLuma(src[i], src[i + 1], src[i + 2]));
+            }
+        }
+        var borderMed = medianLuma(border);
+        var darkMatte = borderMed < 110;
+        var paperCutoff = darkMatte ? Math.min(96, borderMed + 42) : -1;
+        var contentSum = 0;
+        var contentN = 0;
+        for (y = y0; y < y1; y += 1) {
+            for (x = x0; x < x1; x += 1) {
+                i = (y * width + x) * 4;
+                if (src[i + 3] < 128) {
+                    continue;
+                }
+                luma = receiptLuma(src[i], src[i + 1], src[i + 2]);
+                chroma = pixelChroma(src[i], src[i + 1], src[i + 2]);
+                if (darkMatte && luma <= paperCutoff && chroma < 36) {
+                    continue;
+                }
+                contentSum += luma;
+                contentN += 1;
+            }
+        }
+        var contentMean = contentN ? (contentSum / contentN) : 255;
+        var invertArt = darkMatte && contentN >= 8 && contentMean >= 150;
+        var gray = new Uint8Array(width * height);
+        var g;
+        for (y = 0; y < height; y += 1) {
+            for (x = 0; x < width; x += 1) {
+                if (x < x0 || x >= x1 || y < y0 || y >= y1) {
+                    gray[y * width + x] = 255;
+                    continue;
+                }
+                i = (y * width + x) * 4;
+                if (src[i + 3] < 128) {
+                    gray[y * width + x] = 255;
+                    continue;
+                }
+                luma = receiptLuma(src[i], src[i + 1], src[i + 2]);
+                chroma = pixelChroma(src[i], src[i + 1], src[i + 2]);
+                if (darkMatte && luma <= paperCutoff && chroma < 36) {
+                    gray[y * width + x] = 255;
+                    continue;
+                }
+                g = invertArt ? (255 - luma) : luma;
+                gray[y * width + x] = g;
+            }
+        }
+        var out = blankImageData(width, height);
+        var ink = 0;
+        var area = 0;
+        for (y = 0; y < height; y += 1) {
+            for (x = 0; x < width; x += 1) {
+                i = (y * width + x) * 4;
+                var inRect = x >= x0 && x < x1 && y >= y0 && y < y1;
+                var tone = gray[y * width + x];
+                var dot = false;
+                if (inRect && tone < 220) {
+                    dot = tone <= 32 ? true : ditherInk(tone, x, y);
+                }
+                if (dot) {
+                    out.data[i] = 0;
+                    out.data[i + 1] = 0;
+                    out.data[i + 2] = 0;
+                    ink += 1;
+                } else {
+                    out.data[i] = 255;
+                    out.data[i + 1] = 255;
+                    out.data[i + 2] = 255;
+                }
+                out.data[i + 3] = 255;
+                if (inRect) {
+                    area += 1;
+                }
+            }
+        }
+        var inkRatio = area ? ink / area : 1;
+        if (typeof console !== 'undefined' && console.info) {
+            console.info(
+                '[escpos] banner raster',
+                'border', borderMed,
+                'matte', darkMatte,
+                'invert', invertArt,
+                'ink', inkRatio.toFixed(2)
+            );
+        }
+        if (!area || inkRatio > 0.55 || ink < 8) {
+            return null;
+        }
+        return out;
+    }
+
     /**
      * バナー等を ESC * 白黒ビットマップへ（GS v 0 は 58E 互換外のため使わない）。
      * @returns {Promise<Uint8Array|null>}
@@ -465,7 +708,17 @@
         var ctx = band.ctx;
         var ox = Math.floor((maxWidth - dw) / 2);
         ctx.drawImage(img, ox, 0, dw, dh);
-        return escStarRowsFromImageData(ctx.getImageData(0, 0, maxWidth, canvasH), 140);
+        var prepared = prepareReceiptBannerImageData(
+            ctx.getImageData(0, 0, maxWidth, canvasH),
+            { x: ox, y: 0, w: dw, h: dh }
+        );
+        if (!prepared) {
+            if (typeof console !== 'undefined' && console.warn) {
+                console.warn('receipt banner skipped; raster was solid black or empty', url);
+            }
+            return null;
+        }
+        return escStarRowsFromImageData(prepared, 200);
     }
 
     function escStarRowsFromImageData(imageData, inkThreshold) {
@@ -475,6 +728,13 @@
         var threshold = inkThreshold != null ? inkThreshold : IMAGE_INK_THRESHOLD;
         var chunks = [];
         var rowStart;
+        var feedMode = getRasterFeedMode();
+        var lineSpacing = -1;
+        if (feedMode === RASTER_FEED_TIGHT || feedMode === RASTER_FEED_NATIVE) {
+            lineSpacing = ESC_STAR_BAND_DOTS;
+        } else if (feedMode === RASTER_FEED_ZERO) {
+            lineSpacing = 0;
+        }
 
         function isInkAt(pixelIndex) {
             var a = data[pixelIndex + 3];
@@ -486,10 +746,15 @@
             return y < threshold;
         }
 
+        if (lineSpacing >= 0 && height > 0) {
+            // 行間 0 は、帯を印字したあと上下反転した同じ帯を足す機種がある。
+            // 既定は帯の高さに合わせ、LF 1 回だけ進める。
+            chunks.push(cmdSetLineSpacing(lineSpacing));
+        }
         for (rowStart = 0; rowStart < height; rowStart += ESC_STAR_BAND_DOTS) {
             var nL = width & 0xff;
             var nH = (width >> 8) & 0xff;
-            // m=33: 24-dot double-density。紙送りは LF ではなく ESC J 24 で正確に進める
+            // m=33: 24-dot double-density。紙送りは送り方ごとに LF か ESC J。
             var row = [ESC, 0x2a, 33, nL, nH];
             var x;
             for (x = 0; x < width; x += 1) {
@@ -514,8 +779,15 @@
                 row.push(b0, b1, b2);
             }
             chunks.push(new Uint8Array(row));
-            // デフォルト行間の LF だと 24dot 未満しか進まずバンドが重なり「二重」に見える
-            chunks.push(cmdFeedDots(ESC_STAR_BAND_DOTS));
+            if (feedMode === RASTER_FEED_TIGHT) {
+                chunks.push(cmdLineFeed());
+            } else if (feedMode !== RASTER_FEED_NATIVE) {
+                // 58E は既定行間の LF だと 24dot 未満しか進まず帯が重なる。ESC J 24 で進める。
+                chunks.push(cmdFeedDots(ESC_STAR_BAND_DOTS));
+            }
+        }
+        if (lineSpacing >= 0 && height > 0) {
+            chunks.push(cmdDefaultLineSpacing());
         }
         return concatBytes(chunks);
     }
@@ -664,13 +936,20 @@
     P.cmdInit = cmdInit;
     P.cmdFeed = cmdFeed;
     P.cmdFeedDots = cmdFeedDots;
+    P.cmdSetLineSpacing = cmdSetLineSpacing;
+    P.cmdDefaultLineSpacing = cmdDefaultLineSpacing;
     P.cmdCut = cmdCut;
+    P.listRasterFeedModes = listRasterFeedModes;
+    P.getRasterFeedMode = getRasterFeedMode;
+    P.setRasterFeedMode = setRasterFeedMode;
     P.supportsCanvasImagePrint = supportsCanvasImagePrint;
     P.renderBannerEscStar = renderBannerEscStar;
+    P.prepareReceiptBannerImageData = prepareReceiptBannerImageData;
     P.imageLine = imageLine;
     P.imageAmountLine = imageAmountLine;
     P.imageItemLine = imageItemLine;
     P.imageSeparator = imageSeparator;
+    P.escStarRowsFromImageData = escStarRowsFromImageData;
     P.LOAD_TEST_STRIP_DOTS = LOAD_TEST_STRIP_DOTS;
     P.LOAD_TEST_CHUNK_DOTS = LOAD_TEST_CHUNK_DOTS;
     P.renderLoadTestFade = renderLoadTestFade;

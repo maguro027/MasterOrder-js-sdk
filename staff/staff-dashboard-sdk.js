@@ -20,11 +20,30 @@
     var DASHBOARD_CHART_THEME = {
         grid: 'rgba(255, 255, 255, 0.1)',
         text: '#b4bdc4',
+        title: '#f0f3f5',
         tooltipBg: 'rgba(30, 36, 40, 0.95)',
         tooltipBorder: 'rgba(255, 255, 255, 0.12)',
         accent: '#3ec3ff',
         sales: '#28c76f'
     };
+
+    function dashboardChartTheme() {
+        var light = typeof document !== 'undefined'
+            && document.documentElement
+            && document.documentElement.getAttribute('data-theme') === 'light';
+        if (!light) {
+            return DASHBOARD_CHART_THEME;
+        }
+        return {
+            grid: 'rgba(26, 36, 44, 0.12)',
+            text: '#4a5c68',
+            title: '#1a242c',
+            tooltipBg: 'rgba(255, 255, 255, 0.97)',
+            tooltipBorder: 'rgba(26, 36, 44, 0.14)',
+            accent: '#0b7ea8',
+            sales: '#178a4c'
+        };
+    }
 
     var CATEGORY_PIE_COLORS = [
         '#3ec3ff', '#28c76f', '#ff9f43', '#ea5455', '#7367f0',
@@ -247,7 +266,7 @@
      */
     function createStaffDashboardCharts(options) {
         var opts = options || {};
-        var theme = opts.theme || DASHBOARD_CHART_THEME;
+        var theme = opts.theme || dashboardChartTheme();
         var chartInstances = {
             menuRank: null,
             popularRankV2: null,
@@ -763,7 +782,7 @@
             return {
                 enabled: true,
                 backgroundColor: theme.tooltipBg,
-                titleColor: '#f0f3f5',
+                titleColor: theme.title || theme.text,
                 bodyColor: theme.text,
                 borderColor: theme.tooltipBorder,
                 borderWidth: 1,

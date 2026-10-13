@@ -18,6 +18,9 @@
     var PACE_KEY = 'mo.staff.serialPace';
     var USB_CHUNK = 512;
     var SERIAL_CHUNK = 1024;
+    /** 本文はインクが薄い。ロゴ用に下げた 512B 間隔のまま送らない。 */
+    var TEXT_SLICE_BYTES = 4096;
+    var TEXT_SLICE_MS = 40;
     var DEFAULT_TCP_PORT = 9100;
     /** マニュアルモードの入力バッファ（1 回に溜めるバイト）。大きいほうから一段下げて余裕を残す。 */
     var BUFFER_PRESETS = [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536];
@@ -710,7 +713,8 @@
 
     function setDefaultPrinter(entry) {
         var saved = writeDefaultPrinter(entry);
-        if (saved && saved.transport && typeof P.getPrinterMode === 'function'
+        if (saved && saved.transport && saved.transport !== 'os'
+            && typeof P.getPrinterMode === 'function'
             && typeof P.setPrinterMode === 'function'
             && P.getPrinterMode() === 'windows-driver') {
             try {
@@ -806,33 +810,30 @@
     async function listConnectedPrinters() {
         var def = readDefaultPrinter();
         var out = [];
-        if (supportsNativePrinter()) {
+        if (isNativePlatform()) {
             var plugin = getNativeEscPosPlugin();
-            try {
-                if (plugin && typeof plugin.requestPermissions === 'function') {
-                    await plugin.requestPermissions();
+            if (!plugin || typeof plugin.listBluetoothDevices !== 'function') {
+                throw new Error('このアプリから Bluetooth プリンタを読み取れません。アプリを更新してください。');
+            }
+            if (typeof plugin.requestPermissions === 'function') {
+                await plugin.requestPermissions();
+            }
+            var listed = await plugin.listBluetoothDevices();
+            var devices = (listed && listed.devices) || [];
+            for (var bi = 0; bi < devices.length; bi += 1) {
+                var bt = devices[bi] || {};
+                var address = String(bt.address || '');
+                if (!address) {
+                    continue;
                 }
-                var listed = plugin && typeof plugin.listBluetoothDevices === 'function'
-                    ? await plugin.listBluetoothDevices()
-                    : { devices: [] };
-                var devices = (listed && listed.devices) || [];
-                for (var bi = 0; bi < devices.length; bi += 1) {
-                    var bt = devices[bi] || {};
-                    var address = String(bt.address || '');
-                    if (!address) {
-                        continue;
-                    }
-                    var bid = 'bluetooth:' + address;
-                    out.push({
-                        id: bid,
-                        transport: 'bluetooth',
-                        label: String(bt.name || address),
-                        address: address,
-                        isDefault: !!(def && def.id === bid)
-                    });
-                }
-            } catch (_btList) {
-                /* ignore list errors; still show saved default below */
+                var bid = 'bluetooth:' + address;
+                out.push({
+                    id: bid,
+                    transport: 'bluetooth',
+                    label: String(bt.name || address),
+                    address: address,
+                    isDefault: !!(def && def.id === bid)
+                });
             }
             if (def && (def.transport === 'tcp' || def.transport === 'bluetooth')) {
                 var already = out.some(function (row) { return row.id === def.id; });
@@ -1022,9 +1023,6 @@
     }
 
     function requestTcpPrinter(host, port) {
-        if (!supportsNativePrinter()) {
-            throw new Error('LAN/TCP 印刷は Android アプリでのみ利用できます');
-        }
         var h = String(host || '').trim();
         if (!h) {
             throw new Error('プリンタのホスト（IP）が必要です');
@@ -1338,20 +1336,119 @@
     }
 
     /**
-     * 1 バーストを 1024 バイトずつ書く。
+     * 待ちを ESC * の途中に入れない。新型はコマンドの切れ目で改行し、帯が縦に割れる。
+     * 1 コマンドがバッファより長くても、そのコマンドは分割しない。
+     */
+    function escPosCommandLength(data, offset) {
+        var i = offset | 0;
+        var len = data.length;
+        if (i >= len) {
+            return 0;
+        }
+        var b = data[i];
+        if (b === 0x1b && i + 1 < len) {
+            var cmd = data[i + 1];
+            if (cmd === 0x40 || cmd === 0x32) {
+                return 2;
+            }
+            if (cmd === 0x4a || cmd === 0x64 || cmd === 0x33) {
+                return i + 3 <= len ? 3 : (len - i);
+            }
+            if (cmd === 0x2a && i + 4 < len) {
+                var m = data[i + 2];
+                var cols = data[i + 3] + (data[i + 4] << 8);
+                var bytesPerCol = (m === 0 || m === 1) ? 1 : 3;
+                var need = 5 + cols * bytesPerCol;
+                if (need < 5) {
+                    need = 5;
+                }
+                var end = i + need;
+                if (end + 2 < len && data[end] === 0x1b && data[end + 1] === 0x4a) {
+                    need += 3;
+                } else if (end < len && (data[end] === 0x0a || data[end] === 0x0d)) {
+                    need += 1;
+                }
+                return i + need <= len ? need : (len - i);
+            }
+        }
+        if (b === 0x1d && i + 1 < len && data[i + 1] === 0x56) {
+            if (i + 2 < len && data[i + 2] >= 65) {
+                return i + 4 <= len ? 4 : (len - i);
+            }
+            return i + 3 <= len ? 3 : (len - i);
+        }
+        return 1;
+    }
+
+    function sliceEscPosAtCommands(data, maxBytes) {
+        var bytes = data instanceof Uint8Array ? data : new Uint8Array(data || []);
+        var limit = maxBytes | 0;
+        if (limit < 1) {
+            limit = 1;
+        }
+        var slices = [];
+        var start = 0;
+        var i = 0;
+        while (i < bytes.length) {
+            var n = escPosCommandLength(bytes, i);
+            if (n < 1) {
+                break;
+            }
+            var next = i + n;
+            if (next > bytes.length) {
+                next = bytes.length;
+            }
+            if (start < i && (next - start) > limit) {
+                slices.push(bytes.subarray(start, i));
+                start = i;
+            }
+            i = next;
+        }
+        if (start < bytes.length) {
+            slices.push(bytes.subarray(start, bytes.length));
+        }
+        return slices;
+    }
+
+    /**
+     * 1 バーストをコマンド境界で切って書く。
      * 大きい塊はプロファイル単位で releaseLock してから待つ（握ったまま待たない）。
      * port.close() もしない。keep-open。
      */
-    async function writeSerialBytes(port, data, ctx) {
+    function burstKind(list, index, ctx) {
+        if (ctx && (ctx.calibrate || ctx.keepBursts)) {
+            return 'tune';
+        }
+        if (list.length > 1 && index === 0) {
+            return 'logo';
+        }
+        return 'text';
+    }
+
+    function paceForBurst(pace, kind) {
+        if (kind !== 'text') {
+            return pace;
+        }
+        return {
+            paceBytes: Math.max(pace.paceBytes, TEXT_SLICE_BYTES),
+            paceMs: Math.min(pace.paceMs, TEXT_SLICE_MS),
+            logoPauseMs: pace.logoPauseMs,
+            digestPerKb: Math.min(pace.digestPerKb, 25),
+            digestMax: Math.min(pace.digestMax, 900),
+            label: 'text ' + TEXT_SLICE_BYTES + 'B/' + TEXT_SLICE_MS + 'ms'
+        };
+    }
+
+    async function writeSerialBytes(port, data, ctx, paceOpt) {
         if (!data || !data.length) {
             return;
         }
-        var pace = currentPace();
+        var pace = paceOpt || currentPace();
         var sliceWait = (ctx && ctx.calibrate) ? Math.max(pace.paceMs, 280) : pace.paceMs;
-        var offset = 0;
-        while (offset < data.length) {
-            var end = Math.min(offset + pace.paceBytes, data.length);
-            var slice = data.subarray(offset, end);
+        var slices = sliceEscPosAtCommands(data, pace.paceBytes);
+        var si;
+        for (si = 0; si < slices.length; si += 1) {
+            var slice = slices[si];
             var writer = port.writable.getWriter();
             try {
                 var i;
@@ -1361,8 +1458,7 @@
             } finally {
                 writer.releaseLock();
             }
-            offset = end;
-            if (offset < data.length) {
+            if (si + 1 < slices.length) {
                 await sleepMs(sliceWait);
             }
         }
@@ -1448,14 +1544,15 @@
                 throw new Error(beforeErr);
             }
             for (i = 0; i < list.length; i += 1) {
+                var kind = burstKind(list, i, ctx);
+                var burstPace = paceForBurst(pace, kind);
                 if (typeof console !== 'undefined' && console.info) {
-                    console.info('[escpos] serial burst', i + 1, '/', list.length, 'bytes=', list[i].length);
+                    console.info('[escpos] serial burst', i + 1, '/', list.length, kind, 'bytes=', list[i].length, burstPace.paceBytes + 'B/' + burstPace.paceMs + 'ms');
                 }
-                await writeSerialBytes(port, list[i], ctx);
-                var waitMs = Math.max(
-                    (i < list.length - 1) ? pace.logoPauseMs : 0,
-                    postWriteDigestMs(list[i].length, pace)
-                );
+                await writeSerialBytes(port, list[i], ctx, burstPace);
+                var waitMs = kind === 'logo'
+                    ? Math.max(pace.logoPauseMs, postWriteDigestMs(list[i].length, pace))
+                    : postWriteDigestMs(list[i].length, burstPace);
                 if (ctx && ctx.calibrate) {
                     waitMs = Math.max(waitMs, 1200);
                 }
@@ -1549,23 +1646,29 @@
             claimedIface = ep.interfaceNumber;
             var pace = currentPace();
             for (i = 0; i < list.length; i += 1) {
+                var kind = burstKind(list, i, null);
+                var burstPace = paceForBurst(pace, kind);
                 var data = list[i];
-                var offset = 0;
-                while (offset < data.length) {
-                    var sliceEnd = Math.min(offset + pace.paceBytes, data.length);
-                    while (offset < sliceEnd) {
-                        var chunk = data.subarray(offset, Math.min(offset + USB_CHUNK, sliceEnd));
+                var slices = sliceEscPosAtCommands(data, burstPace.paceBytes);
+                var si;
+                for (si = 0; si < slices.length; si += 1) {
+                    var slice = slices[si];
+                    var offset = 0;
+                    while (offset < slice.length) {
+                        var chunk = slice.subarray(offset, Math.min(offset + USB_CHUNK, slice.length));
                         var result = await device.transferOut(ep.endpointNumber, chunk);
                         if (result.status !== 'ok') {
                             throw new Error('USB 転送に失敗しました (' + result.status + ')');
                         }
                         offset += chunk.length;
                     }
-                    if (offset < data.length) {
-                        await sleepMs(pace.paceMs);
+                    if (si + 1 < slices.length) {
+                        await sleepMs(burstPace.paceMs);
                     }
                 }
-                var waitMs = (i < list.length - 1) ? pace.logoPauseMs : postWriteDigestMs(totalBytes, pace);
+                var waitMs = kind === 'logo'
+                    ? Math.max(pace.logoPauseMs, postWriteDigestMs(data.length, pace))
+                    : postWriteDigestMs(data.length, burstPace);
                 await sleepMs(waitMs);
             }
         } catch (err) {
@@ -1586,7 +1689,7 @@
 
     async function resolvePrinterTarget(preferred) {
         var want = preferred || readDefaultPrinter();
-        if (want && (want.transport === 'bluetooth' || want.transport === 'tcp')) {
+        if (want && (want.transport === 'bluetooth' || want.transport === 'tcp' || want.transport === 'os')) {
             return want;
         }
         var list = await listConnectedPrinters();
@@ -1728,34 +1831,39 @@
         var gapMs = pace && pace.paceMs ? Math.min(Math.max(pace.paceMs, 20), 80) : 20;
         var sizes = [512, 256, 128, 20];
         var chunk = sizes[0];
-        var offset = 0;
         var bytes = data instanceof Uint8Array ? data : new Uint8Array(data || []);
-        while (offset < bytes.length) {
-            var end = Math.min(offset + chunk, bytes.length);
-            var slice = bytes.subarray(offset, end);
-            try {
-                if (without) {
-                    await characteristic.writeValueWithoutResponse(slice);
-                } else {
-                    await characteristic.writeValue(slice);
-                }
-            } catch (err) {
-                var next = 0;
-                var si;
-                for (si = 0; si < sizes.length; si += 1) {
-                    if (sizes[si] < chunk) {
-                        next = sizes[si];
-                        break;
+        var commands = sliceEscPosAtCommands(bytes, 1);
+        var ci;
+        for (ci = 0; ci < commands.length; ci += 1) {
+            var block = commands[ci];
+            var offset = 0;
+            while (offset < block.length) {
+                var end = Math.min(offset + chunk, block.length);
+                var slice = block.subarray(offset, end);
+                try {
+                    if (without) {
+                        await characteristic.writeValueWithoutResponse(slice);
+                    } else {
+                        await characteristic.writeValue(slice);
                     }
+                } catch (err) {
+                    var next = 0;
+                    var si;
+                    for (si = 0; si < sizes.length; si += 1) {
+                        if (sizes[si] < chunk) {
+                            next = sizes[si];
+                            break;
+                        }
+                    }
+                    if (next && /GATT|Invalid|too long|exceeds|length/i.test(String(err && (err.message || err.name) || ''))) {
+                        chunk = next;
+                        continue;
+                    }
+                    throw err;
                 }
-                if (next && /GATT|Invalid|too long|exceeds|length/i.test(String(err && (err.message || err.name) || ''))) {
-                    chunk = next;
-                    continue;
-                }
-                throw err;
+                offset = end;
             }
-            offset = end;
-            if (offset < bytes.length && gapMs) {
+            if (ci + 1 < commands.length && gapMs) {
                 await sleepMs(gapMs);
             }
         }
@@ -1876,6 +1984,9 @@
                 if (typeof console !== 'undefined' && console.info) {
                     console.info('[escpos] target', target.transport, target.label || target.id, 'open=', !!(target.port && (target.port.readable || target.port.writable)));
                 }
+                if (target.transport === 'os') {
+                    throw new Error('OS_PRINT');
+                }
                 if (target.transport === 'bluetooth' || target.transport === 'tcp') {
                     if (supportsNativePrinter()) {
                         await printViaNative(target, concatBytes(parts));
@@ -1886,7 +1997,7 @@
                         return;
                     }
                     if (target.transport === 'tcp') {
-                        throw new Error('LAN/TCP 印刷は Android アプリでのみ利用できます');
+                        throw new Error('LAN_BROWSER');
                     }
                     throw new Error('このブラウザでは Bluetooth 印刷に対応していません。PC の Chrome / Edge で「Bluetooth を追加」するか、Android の Staff アプリを使ってください。');
                 }
@@ -1917,6 +2028,7 @@
 
     P.DEFAULT_PRINTER_KEY = DEFAULT_PRINTER_KEY;
     P.SERIAL_PACE_KEY = PACE_KEY;
+    P.sliceEscPosAtCommands = sliceEscPosAtCommands;
     P.BUFFER_PRESETS = BUFFER_PRESETS;
     P.PACE_MS_PRESETS = PACE_MS_PRESETS;
     P.describeSerialPace = describeSerialPace;

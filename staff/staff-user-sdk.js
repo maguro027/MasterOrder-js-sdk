@@ -34,17 +34,89 @@
         return mode === 'KITEI_QR' ? '固定QR' : '都度QR';
     }
 
-    function validatePublicIdClient(raw) {
+    function normalizePublicIdInput(raw) {
         var value = String(raw == null ? '' : raw).trim();
         if (value.charAt(0) === '@') {
             value = value.slice(1).trim();
         }
-        value = value.toLowerCase();
+        return value.toLowerCase();
+    }
+
+    function reservedPublicIdSet() {
+        var list = global.MASTERORDER_RESERVED_PUBLIC_HANDLES;
+        var out = {};
+        if (Array.isArray(list)) {
+            for (var i = 0; i < list.length; i++) {
+                var id = String(list[i] || '').trim().toLowerCase();
+                if (id) {
+                    out[id] = true;
+                }
+            }
+        }
+        if (!Object.keys(out).length) {
+            ['admin', 'root', 'staff', 'system', 'test', 'demo', 'masterorder', 'support', 'help', 'guest', 'user', 'api', 'www']
+                .forEach(function (id) {
+                    out[id] = true;
+                });
+        }
+        return out;
+    }
+
+    function isReservedPublicId(value) {
+        var needle = normalizePublicIdInput(value);
+        if (!needle) {
+            return false;
+        }
+        return !!reservedPublicIdSet()[needle];
+    }
+
+    function publicIdClientMessage(code, normalized) {
+        var id = String(normalized || '').trim().toLowerCase();
+        if (code === 'PUBLIC_ID_TAKEN') {
+            return id ? '「' + id + '」は既に使われています' : 'そのアカウントIDは既に使われています';
+        }
+        if (code === 'PUBLIC_ID_RESERVED') {
+            return id ? '「' + id + '」は使用できないIDです' : 'そのアカウントIDは使用できません';
+        }
+        if (code === 'PUBLIC_ID_IMMUTABLE') {
+            return '名前の変更はできません';
+        }
+        if (code === 'EMPTY') {
+            return 'アカウントIDを入力してください';
+        }
+        if (code === 'TOO_SHORT' || (id && id.length < 3)) {
+            return id
+                ? 'アカウントIDは3〜20文字です（「' + id + '」は' + id.length + '文字です）'
+                : 'アカウントIDは3〜20文字です';
+        }
+        if (code === 'TOO_LONG' || (id && id.length > 20)) {
+            return 'アカウントIDは3〜20文字です';
+        }
+        if (code === 'BAD_START' || (id && !/^[a-z]/.test(id))) {
+            return '先頭は英小文字にしてください';
+        }
+        return '使えるのは英小文字・数字・アンダースコアのみです';
+    }
+
+    function validatePublicIdClient(raw) {
+        var value = normalizePublicIdInput(raw);
         if (!value) {
             return null;
         }
-        if (!/^[a-z][a-z0-9_]{2,19}$/.test(value)) {
-            return '使用できない文字が含まれています（記号や admin・root などの使用禁止名は設定できません）';
+        if (value.length < 3) {
+            return publicIdClientMessage('TOO_SHORT', value);
+        }
+        if (value.length > 20) {
+            return publicIdClientMessage('TOO_LONG', value);
+        }
+        if (!/^[a-z]/.test(value)) {
+            return publicIdClientMessage('BAD_START', value);
+        }
+        if (!/^[a-z][a-z0-9_]*$/.test(value)) {
+            return publicIdClientMessage('BAD_FORMAT', value);
+        }
+        if (isReservedPublicId(value)) {
+            return publicIdClientMessage('PUBLIC_ID_RESERVED', value);
         }
         return null;
     }
@@ -52,14 +124,18 @@
     function formatProfileSaveError(err) {
         var code = err && err.payload && err.payload.code ? String(err.payload.code) : '';
         var serverMsg = err && err.payload && err.payload.message ? String(err.payload.message).trim() : '';
+        var publicId = err && err.payload && err.payload.publicId ? String(err.payload.publicId) : '';
         if (code === 'PUBLIC_ID_TAKEN') {
-            return 'その名前は使用中です';
+            return publicIdClientMessage('PUBLIC_ID_TAKEN', publicId);
         }
         if (code === 'PUBLIC_ID_IMMUTABLE') {
-            return '名前の変更はできません';
+            return publicIdClientMessage('PUBLIC_ID_IMMUTABLE', publicId);
         }
-        if (code === 'PUBLIC_ID_RESERVED' || code === 'INVALID_PUBLIC_ID') {
-            return '使用できない文字が含まれています（記号や admin・root などの使用禁止名は設定できません）';
+        if (code === 'PUBLIC_ID_RESERVED') {
+            return publicIdClientMessage('PUBLIC_ID_RESERVED', publicId);
+        }
+        if (code === 'INVALID_PUBLIC_ID') {
+            return serverMsg || publicIdClientMessage('BAD_FORMAT', publicId);
         }
         if (code === 'GATE_NOT_CONFIGURED' || code === 'GATE_UNAVAILABLE' || code === 'MISCONFIGURED') {
             return 'アカウントIDの設定サービスに接続できません。しばらくしてから再試行するか、管理者に連絡してください';
@@ -70,40 +146,24 @@
         return err && err.message ? String(err.message) : String(err);
     }
 
-    function isProfileSetupComplete(profile) {
+    var PROFILE_COMPLETE_FLAG_PREFIX = 'mo_staff_profile_complete:';
+
+    function profileHasRequiredFields(profile) {
         if (!profile) {
             return false;
         }
         var family = profile.familyName ? String(profile.familyName).trim() : '';
         var given = profile.givenName ? String(profile.givenName).trim() : '';
         var publicId = profile.publicId ? String(profile.publicId).trim() : '';
-        var hasName = family.length > 0 || given.length > 0;
-        var hasPublicId = publicId.length > 0;
-        // 既存ユーザー（名前+ID済み）は利用規約未記録でも通す。新規は同意も必須。
-        if (!hasName || !hasPublicId) {
-            return false;
-        }
-        if (profile.termsAccepted === true) {
-            return true;
-        }
-        // 移行前アカウント: 既に publicId があるなら同意済みとみなす
-        return true;
+        return family.length > 0 && given.length > 0 && publicId.length > 0;
+    }
+
+    function isProfileSetupComplete(profile) {
+        return profileHasRequiredFields(profile);
     }
 
     function needsOnboarding(profile) {
-        if (!profile) {
-            return true;
-        }
-        var family = profile.familyName ? String(profile.familyName).trim() : '';
-        var given = profile.givenName ? String(profile.givenName).trim() : '';
-        var publicId = profile.publicId ? String(profile.publicId).trim() : '';
-        var hasName = family.length > 0 || given.length > 0;
-        var hasPublicId = publicId.length > 0;
-        if (!hasName || !hasPublicId) {
-            return true;
-        }
-        // 名前も ID もあるが規約未同意の「新規直後」ケースは稀。未同意かつ名前/ID不足のみゲート。
-        return false;
+        return !profileHasRequiredFields(profile);
     }
 
     /**
@@ -128,6 +188,8 @@
      *     profileFullNamePreview?: Element,
      *     profilePublicIdInput?: Element,
      *     profilePublicIdHint?: Element,
+     *     profilePublicIdCheckBtn?: Element,
+     *     profilePublicIdCheckStatus?: Element,
      *     profileEmailInput?: Element,
      *     profileEditStatus?: Element,
      *     profileEditBackBtn?: Element,
@@ -173,6 +235,49 @@
         var destroyed = false;
         var onboardingActive = false;
         var onboardingResolver = null;
+        var onboardingPromise = null;
+
+        function profileCompleteStorageKey() {
+            var user = typeof opts.getAuthUser === 'function' ? opts.getAuthUser() : null;
+            var uid = user && user.uid ? String(user.uid) : '';
+            return uid ? (PROFILE_COMPLETE_FLAG_PREFIX + uid) : PROFILE_COMPLETE_FLAG_PREFIX;
+        }
+
+        function readProfileCompleteFlag() {
+            try {
+                return global.localStorage.getItem(profileCompleteStorageKey()) === '1';
+            } catch (_ignored) {
+                return false;
+            }
+        }
+
+        function writeProfileCompleteFlag(complete) {
+            try {
+                var key = profileCompleteStorageKey();
+                if (complete) {
+                    global.localStorage.setItem(key, '1');
+                } else {
+                    global.localStorage.removeItem(key);
+                }
+            } catch (_ignored) {
+                // ignore
+            }
+        }
+
+        function rememberProfileCompletion() {
+            writeProfileCompleteFlag(isProfileSetupComplete(userProfile));
+        }
+
+        function setOnboardingLock(active) {
+            if (!global.document || !global.document.body) {
+                return;
+            }
+            if (active) {
+                global.document.body.classList.add('staff-onboarding-active');
+            } else {
+                global.document.body.classList.remove('staff-onboarding-active');
+            }
+        }
 
         function toast(message, type) {
             if (typeof hooks.toast === 'function') {
@@ -202,14 +307,28 @@
         }
 
         function closeProfileMenu() {
-            if (!el.profileMenu || !el.profileBtn) {
+            if (el.profileBtn) {
+                el.profileBtn.setAttribute('aria-expanded', 'false');
+            }
+            var settingsApi = global.MasterOrderStaffAppSettings;
+            if (settingsApi && typeof settingsApi.close === 'function') {
+                settingsApi.close();
+            }
+            if (!el.profileMenu) {
+                return;
+            }
+            if (el.profileMenu.closest && el.profileMenu.closest('#appSettingsSheet')) {
                 return;
             }
             el.profileMenu.hidden = true;
-            el.profileBtn.setAttribute('aria-expanded', 'false');
         }
 
         function openProfileMenu() {
+            var settingsApi = global.MasterOrderStaffAppSettings;
+            if (settingsApi && typeof settingsApi.open === 'function') {
+                settingsApi.open();
+                return;
+            }
             if (!el.profileMenu || !el.profileBtn) {
                 return;
             }
@@ -267,7 +386,7 @@
             return null;
         }
 
-        async function loadProfile() {
+        async function loadProfile(callOptions) {
             profileLoadedFromNetwork = false;
             if (!clientSdk || typeof clientSdk.getMyProfile !== 'function') {
                 userProfile = fallbackProfileFromAuth();
@@ -276,8 +395,9 @@
             }
             // SWR: キャッシュがあればトークン待ち前に返す。先に waitForAccessToken すると名前表示が遅くなる。
             try {
-                userProfile = await clientSdk.getMyProfile();
+                userProfile = await clientSdk.getMyProfile(callOptions);
                 profileLoadedFromNetwork = true;
+                rememberProfileCompletion();
                 renderDisplayName();
                 return userProfile;
             } catch (err) {
@@ -286,8 +406,9 @@
                     var token = await waitForAccessToken(3);
                     if (token) {
                         try {
-                            userProfile = await clientSdk.getMyProfile();
+                            userProfile = await clientSdk.getMyProfile(callOptions);
                             profileLoadedFromNetwork = true;
+                            rememberProfileCompletion();
                             renderDisplayName();
                             return userProfile;
                         } catch (retryErr) {
@@ -347,9 +468,72 @@
             if (el.profilePublicIdHint) {
                 el.profilePublicIdHint.textContent = hasPublicId
                     ? '@' + profile.publicId + ' は変更できません（名前の変更はできません）。'
-                    : '一度設定すると変更できません。英小文字・数字・アンダースコア（3〜20文字）。admin・root などの使用禁止名は不可。';
+                    : '一度設定すると変更できません。英小文字で始める3〜20文字（数字・アンダースコア可）。admin・root などの使用禁止名は不可。LP のような2文字は使えません。';
             }
+            if (el.profilePublicIdCheckBtn) {
+                el.profilePublicIdCheckBtn.hidden = hasPublicId;
+                el.profilePublicIdCheckBtn.disabled = hasPublicId;
+            }
+            setPublicIdCheckStatus('', '');
             updateProfileFullNamePreview();
+        }
+
+        function setPublicIdCheckStatus(message, kind) {
+            var statusEl = el.profilePublicIdCheckStatus;
+            if (!statusEl) {
+                return;
+            }
+            var text = String(message || '').trim();
+            statusEl.hidden = !text;
+            statusEl.textContent = text;
+            statusEl.className = 'profile-public-id-check' + (kind ? ' is-' + kind : '');
+        }
+
+        async function checkPublicIdAvailability() {
+            if (el.profilePublicIdInput && el.profilePublicIdInput.readOnly) {
+                return;
+            }
+            var raw = el.profilePublicIdInput ? el.profilePublicIdInput.value.trim() : '';
+            if (!raw) {
+                setPublicIdCheckStatus('アカウントIDを入力してください', 'err');
+                return;
+            }
+            var clientErr = validatePublicIdClient(raw);
+            if (clientErr) {
+                setPublicIdCheckStatus(clientErr, 'err');
+                return;
+            }
+            var normalized = normalizePublicIdInput(raw);
+            var sdk = opts.clientSdk;
+            if (!sdk || typeof sdk.checkPublicId !== 'function') {
+                setPublicIdCheckStatus('「' + normalized + '」は形式・使用禁止名の問題はありません。他の人が使っているかは保存時に確認されます。', 'ok');
+                return;
+            }
+            if (el.profilePublicIdCheckBtn) {
+                el.profilePublicIdCheckBtn.disabled = true;
+            }
+            setPublicIdCheckStatus('確認しています…', '');
+            try {
+                var result = await sdk.checkPublicId(normalized);
+                if (result && result.available) {
+                    setPublicIdCheckStatus('「' + (result.publicId || normalized) + '」は使用できます', 'ok');
+                    return;
+                }
+                var code = result && result.code ? String(result.code) : '';
+                var message = result && result.message ? String(result.message).trim() : '';
+                setPublicIdCheckStatus(message || publicIdClientMessage(code, result && result.publicId || normalized), 'err');
+            } catch (err) {
+                var status = err && (err.status || err.statusCode || (err.payload && err.payload.status));
+                if (status === 404 || status === 501) {
+                    setPublicIdCheckStatus('「' + normalized + '」は形式・使用禁止名の問題はありません。他の人が使っているかは保存時に確認されます。', 'ok');
+                    return;
+                }
+                setPublicIdCheckStatus(formatProfileSaveError(err), 'err');
+            } finally {
+                if (el.profilePublicIdCheckBtn && !(userProfile && userProfile.publicId)) {
+                    el.profilePublicIdCheckBtn.disabled = false;
+                }
+            }
         }
 
         function applyProfileEditChromeMode() {
@@ -363,11 +547,18 @@
                     title.textContent = 'アカウント初期設定';
                 }
                 if (subtitle) {
-                    subtitle.textContent = '利用規約に同意のうえ、苗字または名前とアカウントIDを設定してください。IDは一度設定すると変更できません。';
+                    subtitle.textContent = '利用規約に同意のうえ、苗字・名前・アカウントIDをすべて入力してください。IDは一度設定すると変更できません。';
                 }
                 if (el.profileEditBackBtn) {
                     el.profileEditBackBtn.style.display = 'none';
                 }
+                if (el.profileShopSelectBtn) {
+                    el.profileShopSelectBtn.style.display = 'none';
+                }
+                if (el.changeShopBtn) {
+                    el.changeShopBtn.style.display = 'none';
+                }
+                setOnboardingLock(true);
                 if (el.profileTermsBlock) {
                     el.profileTermsBlock.hidden = false;
                 }
@@ -389,6 +580,13 @@
                 if (el.profileEditBackBtn) {
                     el.profileEditBackBtn.style.display = '';
                 }
+                if (el.profileShopSelectBtn) {
+                    el.profileShopSelectBtn.style.display = '';
+                }
+                if (el.changeShopBtn) {
+                    el.changeShopBtn.style.display = '';
+                }
+                setOnboardingLock(false);
                 if (el.profileTermsBlock) {
                     el.profileTermsBlock.hidden = true;
                 }
@@ -455,14 +653,16 @@
         }
 
         function openProfileOnboarding() {
-            if (onboardingActive) {
-                // 二重呼び出し時も画面が消えたままにしない
+            if (onboardingPromise) {
                 paintProfileEditScreen();
-                return Promise.resolve(userProfile);
+                return onboardingPromise;
             }
-            return new Promise(function (resolve) {
+            onboardingPromise = new Promise(function (resolve) {
                 onboardingActive = true;
-                onboardingResolver = resolve;
+                onboardingResolver = function (profile) {
+                    onboardingPromise = null;
+                    resolve(profile);
+                };
                 closeProfileMenu();
                 var chain = Promise.resolve();
                 if (typeof hooks.onBeforeProfileEditOpen === 'function') {
@@ -476,6 +676,20 @@
                     return loadProfile();
                 }).then(function () {
                     paintProfileEditScreen();
+                    if (!needsOnboarding(userProfile)) {
+                        onboardingActive = false;
+                        var done = onboardingResolver;
+                        onboardingResolver = null;
+                        onboardingPromise = null;
+                        setOnboardingLock(false);
+                        applyProfileEditChromeMode();
+                        if (el.profileEditScreen) {
+                            el.profileEditScreen.style.display = 'none';
+                        }
+                        if (typeof done === 'function') {
+                            done(userProfile);
+                        }
+                    }
                 }).catch(function (err) {
                     if (typeof console !== 'undefined' && console.warn) {
                         console.warn('[StaffUser] onboarding open failed', err);
@@ -492,6 +706,7 @@
                 });
                 void chain;
             });
+            return onboardingPromise;
         }
 
         function closeProfileEdit() {
@@ -522,8 +737,12 @@
         async function saveProfileEdit() {
             var familyName = el.profileFamilyNameInput ? el.profileFamilyNameInput.value.trim() : '';
             var givenName = el.profileGivenNameInput ? el.profileGivenNameInput.value.trim() : '';
-            if (!familyName && !givenName) {
-                showStatus(el.profileEditStatus, '苗字または名前を入力してください', 'error');
+            if (!familyName) {
+                showStatus(el.profileEditStatus, '苗字を入力してください', 'error');
+                return;
+            }
+            if (!givenName) {
+                showStatus(el.profileEditStatus, '名前を入力してください', 'error');
                 return;
             }
             var publicIdInput = el.profilePublicIdInput;
@@ -543,14 +762,16 @@
             var textUi = global.MasterOrderTextInputUi;
             if (textUi) {
                 var familyErr = requireValidOrError(textUi, el.profileFamilyNameInput, '苗字', {
-                    maxLength: textUi.LIMITS.shortLabel
+                    maxLength: textUi.LIMITS.personName,
+                    personName: true
                 });
                 if (familyErr) {
                     showStatus(el.profileEditStatus, familyErr, 'error');
                     return;
                 }
                 var givenErr = requireValidOrError(textUi, el.profileGivenNameInput, '名前', {
-                    maxLength: textUi.LIMITS.shortLabel
+                    maxLength: textUi.LIMITS.personName,
+                    personName: true
                 });
                 if (givenErr) {
                     showStatus(el.profileEditStatus, givenErr, 'error');
@@ -600,9 +821,10 @@
                     }
                 }
                 if (onboardingActive && !isProfileSetupComplete(userProfile)) {
-                    showStatus(el.profileEditStatus, '名前とアカウントIDの設定を完了してください', 'error');
+                    showStatus(el.profileEditStatus, '苗字・名前・アカウントIDの設定を完了してください', 'error');
                     return;
                 }
+                rememberProfileCompletion();
                 renderDisplayName();
                 if (typeof hooks.onProfileSaved === 'function') {
                     await hooks.onProfileSaved(userProfile);
@@ -632,6 +854,59 @@
                     } else {
                         el.profileEditSaveBtn.disabled = false;
                     }
+                }
+            }
+        }
+
+        async function redeemPromoCode() {
+            var input = el.profilePromoCodeInput;
+            var code = input ? String(input.value || '').trim() : '';
+            if (!code) {
+                showStatus(el.profilePromoStatus, 'コードを入力してください', 'error');
+                return;
+            }
+            if (!clientSdk || typeof clientSdk.redeemPromotion !== 'function') {
+                showStatus(el.profilePromoStatus, 'この画面からはまだ使えません', 'error');
+                return;
+            }
+            if (el.profilePromoRedeemBtn) {
+                el.profilePromoRedeemBtn.disabled = true;
+            }
+            try {
+                var result = await clientSdk.redeemPromotion(code);
+                if (input) {
+                    input.value = '';
+                }
+                var ownerGranted = !!(result && (result.ownerGranted === true || result.accountType === 'OWNER'));
+                var message = result && result.message
+                    ? String(result.message)
+                    : (ownerGranted
+                        ? 'オーナー化しました。反映まで数分かかることがあります。'
+                        : 'プロモーションを適用しました');
+                if (ownerGranted && userProfile) {
+                    userProfile.accountType = 'OWNER';
+                    userProfile.canCreateShop = true;
+                    if (!(Number(userProfile.shopSlots) > 0)) {
+                        userProfile.shopSlots = 1;
+                    }
+                }
+                showStatus(el.profilePromoStatus, message, 'success');
+                toast(message, 'success');
+                if (typeof clientSdk.getMyProfile === 'function') {
+                    clientSdk.getMyProfile().then(function (profile) {
+                        if (!profile) {
+                            return;
+                        }
+                        userProfile = profile;
+                        renderDisplayName();
+                    }).catch(function () {});
+                }
+            } catch (err) {
+                var serverMsg = err && err.payload && err.payload.message ? String(err.payload.message) : '';
+                showStatus(el.profilePromoStatus, serverMsg || (err && err.message) || '適用できませんでした', 'error');
+            } finally {
+                if (el.profilePromoRedeemBtn) {
+                    el.profilePromoRedeemBtn.disabled = false;
                 }
             }
         }
@@ -728,6 +1003,11 @@
 
         function onProfileBtnClick(ev) {
             ev.stopPropagation();
+            var settingsApi = global.MasterOrderStaffAppSettings;
+            if (settingsApi && typeof settingsApi.toggle === 'function') {
+                settingsApi.toggle();
+                return;
+            }
             if (el.profileMenu && el.profileMenu.hidden) {
                 openProfileMenu();
             } else {
@@ -736,6 +1016,18 @@
         }
 
         function onDocumentClick(ev) {
+            var sheet = global.document.getElementById('appSettingsSheet');
+            var menuInSheet = el.profileMenu && el.profileMenu.closest && el.profileMenu.closest('#appSettingsSheet');
+            if (menuInSheet) {
+                if (!sheet || sheet.hidden) {
+                    return;
+                }
+                if (sheet.contains(ev.target)) {
+                    return;
+                }
+                closeProfileMenu();
+                return;
+            }
             if (!el.profileWrap || !el.profileMenu || el.profileMenu.hidden) {
                 return;
             }
@@ -768,6 +1060,9 @@
             }
             if (el.profileShopSelectBtn) {
                 el.profileShopSelectBtn.addEventListener('click', function () {
+                    if (onboardingActive) {
+                        return;
+                    }
                     closeProfileMenu();
                     if (typeof hooks.onShopSelectRequest === 'function') {
                         hooks.onShopSelectRequest();
@@ -787,6 +1082,21 @@
                     void saveProfileEdit();
                 });
             }
+            if (el.profilePromoRedeemBtn) {
+                el.profilePromoRedeemBtn.addEventListener('click', function () {
+                    void redeemPromoCode();
+                });
+            }
+            if (el.profilePublicIdCheckBtn) {
+                el.profilePublicIdCheckBtn.addEventListener('click', function () {
+                    void checkPublicIdAvailability();
+                });
+            }
+            if (el.profilePublicIdInput) {
+                el.profilePublicIdInput.addEventListener('input', function () {
+                    setPublicIdCheckStatus('', '');
+                });
+            }
             if (el.profileTermsAcceptInput) {
                 el.profileTermsAcceptInput.addEventListener('change', syncOnboardingSaveEnabled);
             }
@@ -804,6 +1114,9 @@
             }
             if (el.changeShopBtn) {
                 el.changeShopBtn.addEventListener('click', function () {
+                    if (onboardingActive) {
+                        return;
+                    }
                     if (typeof hooks.onShopSelectRequest === 'function') {
                         hooks.onShopSelectRequest();
                     }
@@ -824,6 +1137,7 @@
                 return;
             }
             destroyed = true;
+            setOnboardingLock(false);
             stopNotifications();
             closeProfileMenu();
             unbindUi();
@@ -850,12 +1164,14 @@
                 return isProfileSetupComplete(userProfile);
             },
             needsOnboarding: function () {
-                /* 取得失敗時の Auth フォールバックを「未設定」扱いすると、
-                   新規インストール後に店舗選択が消えて初期設定だけ残る */
-                if (!profileLoadedFromNetwork) {
+                if (profileLoadedFromNetwork) {
+                    return needsOnboarding(userProfile);
+                }
+                // 取得前/失敗時: 完了フラグがある既存端末だけ通す。新規は他UIへ進めない。
+                if (readProfileCompleteFlag()) {
                     return false;
                 }
-                return needsOnboarding(userProfile);
+                return true;
             },
             closeProfileMenu: closeProfileMenu,
             openProfileMenu: openProfileMenu,
@@ -872,6 +1188,10 @@
         DEFAULT_FAMILY_NAME_PLACEHOLDER: DEFAULT_FAMILY_NAME_PLACEHOLDER,
         isProfileSetupComplete: isProfileSetupComplete,
         needsOnboarding: needsOnboarding,
+        profileHasRequiredFields: profileHasRequiredFields,
+        normalizePublicIdInput: normalizePublicIdInput,
+        validatePublicIdClient: validatePublicIdClient,
+        isReservedPublicId: isReservedPublicId,
         resolveDisplayFamilyName: resolveDisplayFamilyName,
         buildProfileFullName: buildProfileFullName,
         createStaffUserChrome: createStaffUserChrome

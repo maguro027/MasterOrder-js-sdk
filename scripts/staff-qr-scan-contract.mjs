@@ -44,6 +44,18 @@ assert.equal(creds.kind, 'credentials');
 assert.equal(creds.sessionId, 'sid-1');
 assert.equal(creds.pin, 'ABCD');
 
+const shareCreds = sdk.parseStaffQrScanText(
+  'https://order.example/Shop/nakano/share/?id=sid-1&pass=ABCD'
+);
+assert.equal(shareCreds.kind, 'credentials');
+assert.equal(shareCreds.sessionId, 'sid-1');
+assert.equal(shareCreds.pin, 'ABCD');
+
+const shareNotFixed = sdk.parseStaffQrScanText(
+  'https://order.example/Shop/nakano/share/?tableNo=3&passPhrase=ABCDEFGHIJ'
+);
+assert.equal(shareNotFixed, null);
+
 const join = sdk.parseStaffQrScanText(
   'https://order.example/Shop/nakano/?join=opaque-token'
 );
@@ -58,5 +70,31 @@ assert.equal(
   'session'
 );
 assert.equal(sdk.staffQrShopMatches('', 'nakano'), false);
+
+const exportDefaults = sdk.normalizeQrExportOptions({});
+assert.equal(exportDefaults.sizePx, sdk.QR_EXPORT_DEFAULT_SIZE);
+assert.equal(exportDefaults.marginPx, sdk.QR_EXPORT_DEFAULT_MARGIN);
+assert.equal(exportDefaults.canvasPx, exportDefaults.sizePx + exportDefaults.marginPx * 2);
+
+const exportClamped = sdk.normalizeQrExportOptions({ sizePx: 20, marginPx: 9000 });
+assert.equal(exportClamped.sizePx, 128);
+assert.ok(exportClamped.marginPx <= 64);
+assert.equal(exportClamped.canvasPx, exportClamped.sizePx + exportClamped.marginPx * 2);
+
+const exportMax = sdk.normalizeQrExportOptions({ sizePx: 99999, marginPx: 800 });
+assert.equal(exportMax.sizePx, 4096);
+assert.equal(exportMax.marginPx, 0);
+assert.equal(exportMax.canvasPx, 4096);
+
+assert.equal(sdk.qrExportFilename(3, 'fixed'), 'table-3-qr.png');
+assert.equal(sdk.qrExportFilename(12, 'session'), 'table-12-session-qr.png');
+assert.equal(sdk.qrExportFilename(0, 'fixed'), 'qr.png');
+
+const staffQrSource = fs.readFileSync(path.join(root, 'staff', 'staff-qr-sdk.js'), 'utf8');
+assert.match(
+  staffQrSource,
+  /buildShopScopedGuestSharePath[\s\S]*\/share\//,
+  'staff join URLs must use the /share/ path'
+);
 
 console.log('staff QR scan contract OK');

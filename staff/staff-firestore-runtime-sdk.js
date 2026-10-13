@@ -9,7 +9,7 @@
 (function (global) {
     'use strict';
 
-    var SDK_VERSION = '1.0.5';
+    var SDK_VERSION = '1.0.6';
 
     function noop() {}
 
@@ -82,7 +82,8 @@
      *   setTableSeatSyncHint?: function(boolean, string),
      *   finishRender?: function(),
      *   getSessionListEl?: function(): Element,
-     *   renderEmpty?: function(Element, string, boolean),
+     *   sessionListHasCards?: function(): boolean,
+     *   renderEmpty?: function(Element, string, boolean, boolean),
      *   renderKiteiQr?: function(Array, object): boolean,
      *   renderViewsNow?: function(),
      *   applySessionTabLayout?: function(),
@@ -299,12 +300,29 @@
             }, delayMs);
         }
 
-        function showSessionsLoading(message) {
+        function sessionListHasCards() {
+            return callOpt(opts.sessionListHasCards) === true;
+        }
+
+        /**
+         * カードが既にある再接続では一覧を消さない。
+         * 空の「読み込み中」やエラー文への差し替えが、席一覧が消えたように見える。
+         */
+        function replaceSessionListWithMessage(message, isError, isLoading) {
+            if (sessionListHasCards()) {
+                callOpt(opts.setSessionLoadStatus, message, '');
+                return;
+            }
             var listEl = callOpt(opts.getSessionListEl);
             if (listEl && typeof opts.renderEmpty === 'function') {
-                opts.renderEmpty(listEl, message || 'セッションを読み込み中...', false, true);
+                opts.renderEmpty(listEl, message, !!isError, !!isLoading);
             }
-            callOpt(opts.setSessionLoadStatus, message || 'セッションを読み込み中...', 'Firestore 同期待ち');
+        }
+
+        function showSessionsLoading(message) {
+            var text = message || 'セッションを読み込み中...';
+            replaceSessionListWithMessage(text, false, true);
+            callOpt(opts.setSessionLoadStatus, text, 'Firestore 同期待ち');
         }
 
         function clearSnapshotWaitTimer() {
@@ -388,7 +406,8 @@
             if (firestoreSdk && typeof firestoreSdk.stopAll === 'function') {
                 firestoreSdk.stopAll();
             }
-            if (sessionCache && typeof sessionCache.reset === 'function') {
+            var keepSessionCache = so.keepSessionCache === true;
+            if (!keepSessionCache && sessionCache && typeof sessionCache.reset === 'function') {
                 sessionCache.reset();
             }
             if (!keepTableCache) {
@@ -543,15 +562,12 @@
                         : '⚠️ Firestore 読取不可のため REST でセッション一覧を表示しています。');
             }).catch(function (e) {
                 callOpt(opts.markFirestoreBackoff, e);
-                var sessionListEl = callOpt(opts.getSessionListEl);
                 var message = typeof opts.staffUserVisibleLoadError === 'function'
                     ? opts.staffUserVisibleLoadError(e, '未知の問題が発生しました')
                     : (typeof opts.formatStaffApiError === 'function'
                         ? opts.formatStaffApiError(e, 'セッション一覧の取得に失敗しました')
                         : '未知の問題が発生しました');
-                if (sessionListEl && typeof opts.renderEmpty === 'function') {
-                    opts.renderEmpty(sessionListEl, message, true);
-                }
+                replaceSessionListWithMessage(message, true, false);
             });
         }
 
@@ -715,15 +731,12 @@
                             : function () { return Promise.resolve({ ok: false, reason: 'disabled' }); };
                         return syncFn({ shopId: activeShopId }).then(function (syncResult) {
                             if (!syncResult || !syncResult.ok) {
-                                var sessionListEl = callOpt(opts.getSessionListEl);
                                 if (kiteiQrMode) {
                                     callOpt(opts.setTableSeatSyncHint, true, formatClaimsError(syncResult));
                                     loadActiveSessionsViaRest({ silent: true, reason: 'firestore_error' });
                                     return;
                                 }
-                                if (sessionListEl && typeof opts.renderEmpty === 'function') {
-                                    opts.renderEmpty(sessionListEl, formatClaimsError(syncResult), true);
-                                }
+                                replaceSessionListWithMessage(formatClaimsError(syncResult), true, false);
                                 return;
                             }
                             return afterClaimsOk();
@@ -733,7 +746,10 @@
                     showSessionsLoading('セッションを読み込み中...');
 
                     if (kiteiQrMode) {
-                        if (sessionCache && typeof sessionCache.reset === 'function') {
+                        var hasCachedSnapshot = sessionCache
+                            && typeof sessionCache.hasSnapshot === 'function'
+                            && sessionCache.hasSnapshot();
+                        if (!hasCachedSnapshot && sessionCache && typeof sessionCache.reset === 'function') {
                             sessionCache.reset();
                         }
                         if (firestoreSdk && typeof firestoreSdk.invalidateActiveSessionListenerSignature === 'function') {
@@ -748,16 +764,13 @@
                             }),
                             runClaimsThenAttach()
                         ]).then(function () {
-                            if (metaError && !ready && !tableSeatsCache.length) {
-                                var listEl = callOpt(opts.getSessionListEl);
+                            if (metaError && !ready && !tableSeatsCache.length && !sessionListHasCards()) {
                                 var message = typeof opts.staffUserVisibleLoadError === 'function'
                                     ? opts.staffUserVisibleLoadError(metaError, '未知の問題が発生しました')
                                     : (typeof opts.formatStaffApiError === 'function'
                                         ? opts.formatStaffApiError(metaError, 'テーブル一覧の取得に失敗しました')
                                         : '未知の問題が発生しました');
-                                if (listEl && typeof opts.renderEmpty === 'function') {
-                                    opts.renderEmpty(listEl, message, true);
-                                }
+                                replaceSessionListWithMessage(message, true, false);
                                 callOpt(opts.finishRender);
                             }
                         });

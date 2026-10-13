@@ -44,8 +44,98 @@
         return input;
     }
 
+    function normalizeAuthErrorCode(err) {
+        var code = String((err && (err.code || err.errorCode)) || '').toLowerCase();
+        var msg = (err && err.message) ? String(err.message) : String(err || '');
+        if (code.indexOf('auth/') === 0) {
+            return code;
+        }
+        var fromMsg = msg.match(/auth\/[a-z0-9-]+/i);
+        if (fromMsg) {
+            return fromMsg[0].toLowerCase();
+        }
+        if (msg.indexOf('EMAIL_EXISTS') >= 0) {
+            return 'auth/email-already-in-use';
+        }
+        if (msg.indexOf('INVALID_EMAIL') >= 0) {
+            return 'auth/invalid-email';
+        }
+        if (msg.indexOf('WEAK_PASSWORD') >= 0) {
+            return 'auth/weak-password';
+        }
+        if (msg.indexOf('INVALID_LOGIN_CREDENTIALS') >= 0 || msg.indexOf('INVALID_PASSWORD') >= 0) {
+            return 'auth/invalid-credential';
+        }
+        if (msg.indexOf('EMAIL_NOT_FOUND') >= 0 || msg.indexOf('USER_NOT_FOUND') >= 0) {
+            return 'auth/user-not-found';
+        }
+        if (msg.indexOf('OPERATION_NOT_ALLOWED') >= 0) {
+            return 'auth/operation-not-allowed';
+        }
+        if (msg.indexOf('TOO_MANY_ATTEMPTS') >= 0) {
+            return 'auth/too-many-requests';
+        }
+        if (msg.indexOf('PASSWORD_DOES_NOT_MEET_REQUIREMENTS') >= 0
+            || msg.indexOf('password-does-not-meet-requirements') >= 0) {
+            return 'auth/password-does-not-meet-requirements';
+        }
+        return code;
+    }
+
+    var PASSWORD_POLICY = {
+        minLength: 6,
+        requireUppercase: true,
+        requireLowercase: true,
+        requireNumeric: false,
+        requireSpecial: false
+    };
+
+    function passwordPolicyHint() {
+        return '英大文字・小文字を含む6文字以上';
+    }
+
+    function validateSignupPassword(password) {
+        var value = String(password || '');
+        if (value.length < PASSWORD_POLICY.minLength) {
+            return 'パスワードは' + PASSWORD_POLICY.minLength + '文字以上にしてください。';
+        }
+        if (PASSWORD_POLICY.requireUppercase && !/[A-Z]/.test(value)) {
+            return 'パスワードに英大文字を含めてください。';
+        }
+        if (PASSWORD_POLICY.requireLowercase && !/[a-z]/.test(value)) {
+            return 'パスワードに英小文字を含めてください。';
+        }
+        if (PASSWORD_POLICY.requireNumeric && !/[0-9]/.test(value)) {
+            return 'パスワードに数字を含めてください。';
+        }
+        if (PASSWORD_POLICY.requireSpecial && !/[^A-Za-z0-9]/.test(value)) {
+            return 'パスワードに記号を含めてください。';
+        }
+        return '';
+    }
+
+    function formatPasswordPolicyError(msg) {
+        var missing = [];
+        if (/upper case/i.test(msg) || /uppercase/i.test(msg)) {
+            missing.push('英大文字');
+        }
+        if (/lower case/i.test(msg) || /lowercase/i.test(msg)) {
+            missing.push('英小文字');
+        }
+        if (/numeric/i.test(msg)) {
+            missing.push('数字');
+        }
+        if (/non-alphanumeric|special/i.test(msg)) {
+            missing.push('記号');
+        }
+        if (missing.length) {
+            return 'パスワードに ' + missing.join('・') + ' を含めてください。';
+        }
+        return 'パスワードが要件を満たしていません。' + passwordPolicyHint() + 'にしてください。';
+    }
+
     function formatAuthError(err) {
-        var code = err && (err.code || err.errorCode || '');
+        var code = normalizeAuthErrorCode(err);
         var msg = (err && err.message) ? String(err.message) : String(err || '不明なエラー');
         if (code === 'auth/email-already-in-use') {
             return 'このメールアドレスは既に登録されています。ログインしてください。';
@@ -54,9 +144,12 @@
             return 'メールアドレスの形式が正しくありません。';
         }
         if (code === 'auth/weak-password') {
-            return 'パスワードは6文字以上にしてください。';
+            return 'パスワードは' + PASSWORD_POLICY.minLength + '文字以上にしてください。';
         }
-        if (code === 'auth/wrong-password' || code === 'auth/invalid-credential') {
+        if (code === 'auth/password-does-not-meet-requirements') {
+            return formatPasswordPolicyError(msg);
+        }
+        if (isWrongPasswordError({ code: code })) {
             return 'メールアドレスまたはパスワードが正しくありません。';
         }
         if (code === 'auth/user-not-found') {
@@ -71,7 +164,15 @@
         if (code === 'auth/missing-email') {
             return 'メールアドレスを入力してください。';
         }
+        if (code === 'auth/operation-not-allowed' || code === 'auth/admin-restricted-operation') {
+            return 'メールログインが有効になっていません。管理者に連絡してください。';
+        }
         return msg;
+    }
+
+    function isWrongPasswordError(err) {
+        var code = normalizeAuthErrorCode(err);
+        return code === 'auth/wrong-password' || code === 'auth/invalid-credential';
     }
 
     /**
@@ -155,10 +256,13 @@
 
     global.MasterOrderStaffEmailAuthSdk = {
         VERSION: SDK_VERSION,
+        passwordPolicyHint: passwordPolicyHint,
+        validateSignupPassword: validateSignupPassword,
         usesPasswordProvider: usesPasswordProvider,
         needsEmailVerification: needsEmailVerification,
         parseOobCode: parseOobCode,
         formatAuthError: formatAuthError,
+        isWrongPasswordError: isWrongPasswordError,
         signUpWithEmail: signUpWithEmail,
         signInWithEmail: signInWithEmail,
         sendPasswordResetEmail: sendPasswordResetEmail,

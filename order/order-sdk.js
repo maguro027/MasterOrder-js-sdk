@@ -297,6 +297,13 @@
         if (!locationRef) {
             return false;
         }
+        if (isGuestShareJoinPath(locationRef)) {
+            return false;
+        }
+        var join = parseJoinCredentialsFromSearch(locationRef.search || '');
+        if (join.sessionId && join.pin) {
+            return false;
+        }
         var parsed = readFixedQrParamsFromLocation(locationRef);
         if (!/^\d+$/.test(parsed.tableNo) || !parsed.passPhrase || parsed.passPhrase.length > 128) {
             return false;
@@ -641,15 +648,39 @@
         return GUEST_SHOP_PATH_PREFIX + '/' + encodeURIComponent(slug) + '/';
     }
 
-    function buildShopScopedGuestUrl(shopSlug, sessionId, pin) {
+    /** 合流専用。卓の固定QR（数字の卓パス + passPhrase）とは別パス。 */
+    function buildShopScopedGuestSharePath(shopSlug) {
         var path = buildShopScopedGuestPath(shopSlug);
         if (!path) {
             return '';
         }
+        return path.replace(/\/+$/, '') + '/share/';
+    }
+
+    function isGuestShareJoinPath(loc) {
+        var pathname = '';
+        if (typeof loc === 'string') {
+            pathname = loc;
+        } else if (loc && loc.pathname != null) {
+            pathname = loc.pathname;
+        } else if (typeof location !== 'undefined') {
+            pathname = location.pathname;
+        }
+        var parts = String(pathname || '/').split('/').filter(Boolean);
+        return parts.length >= 3
+            && String(parts[0]).toLowerCase() === 'shop'
+            && String(parts[2]).toLowerCase() === 'share';
+    }
+
+    function buildShopScopedGuestUrl(shopSlug, sessionId, pin) {
         var id = sanitizeGuestSessionId(sessionId);
         var normalizedPin = sanitizeGuestJoinPin(pin);
         if (!id || !normalizedPin) {
-            return path;
+            return buildShopScopedGuestPath(shopSlug);
+        }
+        var path = buildShopScopedGuestSharePath(shopSlug);
+        if (!path) {
+            return '';
         }
         var params = new URLSearchParams();
         params.set('id', id);
@@ -1060,6 +1091,28 @@
             return true;
         }
         return false;
+    }
+
+    /** 来客セッション API を Gate 直で呼ぶ base。{@code window._guestSessionViaGate = false} で VPS に戻す。 */
+    function guestSessionGateBase(options) {
+        var flag = options && options.guestSessionViaGate != null
+            ? options.guestSessionViaGate
+            : global._guestSessionViaGate;
+        if (flag === false || flag === 'false') {
+            return '';
+        }
+        return resolveDirectGateBase();
+    }
+
+    /** Gate が落ちている / WAF・HTML が返ったときだけ VPS へ逃がす（PIN 不一致などの 4xx は逃がさない）。 */
+    function shouldFallbackGuestSessionToServer(err) {
+        if (!err) {
+            return false;
+        }
+        if (!(err instanceof core.ApiError)) {
+            return true;
+        }
+        return shouldRetryCatalogOnGateDirect(err) || err.status === 504;
     }
 
     function usesGateCatalogRead() {
@@ -2663,7 +2716,7 @@
         }
         const params = new URLSearchParams();
         params.set(JOIN_TOKEN_PARAM, token);
-        return base + buildShopScopedGuestPath(slug) + '?' + params.toString();
+        return base + buildShopScopedGuestSharePath(slug) + '?' + params.toString();
     }
 
     function buildOrderJoinUrl(baseUrl, sessionId, pin, shopSlug) {
@@ -2686,7 +2739,7 @@
         params.delete(JOIN_SESSION_PARAM);
         params.delete(JOIN_PIN_PARAM);
         // 接続成功後は address bar / history / Referer に PIN を残さない。
-        // 共有 QR は buildShopScopedGuestUrl が明示的に id/pass を付ける。
+        // 共有 QR は buildShopScopedGuestUrl が /share/ と id/pass を付ける。
         params.delete('id');
         params.delete('pass');
         LEGACY_GUEST_QUERY_KEYS.forEach(function (key) {
@@ -4860,6 +4913,54 @@
         const profileApi = (options.getAccessToken || options.getIdToken)
             ? core.createProfileApi(http, authPaths)
             : null;
+        const gateSessionBase = guestSessionGateBase(options);
+        const gateSessionHttp = gateSessionBase
+            ? core.createHttpClient({ baseUrl: gateSessionBase })
+            : null;
+
+        /**
+         * 店舗 UUID が分かるときは Gate 直、分からない／Gate 障害のときは VPS。
+         * @param {*} shopId
+         * @param {function(object, string): Promise} gateCall (gateHttp, shopPublicId)
+         * @param {function(): Promise} serverCall
+         */
+        function guestSessionCall(shopId, gateCall, serverCall) {
+            var publicId = gateSessionHttp ? shopPublicIdForConnectQuery(shopId) : null;
+            if (!publicId) {
+                return serverCall();
+            }
+            return gateCall(gateSessionHttp, publicId).catch(function (err) {
+                if (shouldFallbackGuestSessionToServer(err)) {
+                    return serverCall();
+                }
+                throw err;
+            });
+        }
+
+        function getGuestConnectSession(sessionId, pin, shopId) {
+            var headers = withGuestOrderHeaders({}, pin, { clientId: ensureGuestClientId() });
+            return guestSessionCall(shopId, function (gateHttp, publicId) {
+                return gateHttp.get(
+                    core.withQuery(gateGuestPaths.connectSession(sessionId), { shopPublicId: publicId }),
+                    headers
+                );
+            }, function () {
+                return http.get(
+                    core.withQuery(guestPaths.connectSession(sessionId), applyConnectShopScope({}, shopId)),
+                    headers
+                );
+            });
+        }
+
+        function getGuestJoinInfo(joinToken, shopId) {
+            return guestSessionCall(shopId, function (gateHttp, publicId) {
+                return gateHttp.get(
+                    core.withQuery(gateGuestPaths.joinSession(joinToken), { shopPublicId: publicId })
+                );
+            }, function () {
+                return http.get(guestPaths.joinSession(joinToken));
+            });
+        }
 
         function getGuestConnectOrderHistory(sessionId, pin, shopId, limit) {
             var resolvedSessionId = resolveSessionIdFromContext(sessionId);
@@ -4873,13 +4974,24 @@
             // connect と同じ shop スコープ（UUID → shopPublicId、int → shopId）
             var connectQuery = applyConnectShopScope({}, shopId);
             var cappedLimit = limit != null ? limit : 50;
-            return http.get(
-                core.withQuery(
-                    guestPaths.connectOrders(resolvedSessionId),
-                    Object.assign({ limit: cappedLimit }, connectQuery)
-                ),
-                withGuestOrderHeaders({}, resolvedPin, { clientId: ensureGuestClientId() })
-            ).then(function (orders) {
+            var headers = withGuestOrderHeaders({}, resolvedPin, { clientId: ensureGuestClientId() });
+            return guestSessionCall(shopId, function (gateHttp, publicId) {
+                return gateHttp.get(
+                    core.withQuery(
+                        gateGuestPaths.connectOrders(resolvedSessionId),
+                        { limit: cappedLimit, shopPublicId: publicId }
+                    ),
+                    headers
+                );
+            }, function () {
+                return http.get(
+                    core.withQuery(
+                        guestPaths.connectOrders(resolvedSessionId),
+                        Object.assign({ limit: cappedLimit }, connectQuery)
+                    ),
+                    headers
+                );
+            }).then(function (orders) {
                 return Array.isArray(orders)
                     ? orders.map(core.normalizeOrderHistoryItem).filter(Boolean)
                     : [];
@@ -4928,45 +5040,50 @@
         const sdk = {
             api: http.request,
             connectSession: function (sessionId, pin, shopId) {
-                var connectQuery = applyConnectShopScope({}, shopId);
-                return http.get(
-                    core.withQuery(
-                        guestPaths.connectSession(sessionId),
-                        connectQuery
-                    ),
-                    withGuestOrderHeaders({}, pin, { clientId: ensureGuestClientId() })
-                );
+                return getGuestConnectSession(sessionId, pin, shopId);
             },
             getGuestConnectOrderHistory: getGuestConnectOrderHistory,
             connectSessionDetail: function (sessionId, pin, shopId) {
-                var connectQuery = applyConnectShopScope({}, shopId);
                 // 接続自体を履歴取得でブロックしない（履歴は apply 後に非同期で埋める）
-                return http.get(
-                    core.withQuery(
-                        guestPaths.connectSession(sessionId),
-                        connectQuery
-                    ),
-                    withGuestOrderHeaders({}, pin, { clientId: ensureGuestClientId() })
-                )
+                return getGuestConnectSession(sessionId, pin, shopId)
                     .then(function (session) {
                         return parseSessionConnect(session, sessionId, pin);
                     });
             },
             registerGuestRoster: function (sessionId, pin, shopId) {
                 var query = applyConnectShopScope({}, shopId);
-                return http.post(
-                    core.withQuery(guestPaths.registerGuestRoster(sessionId), query),
-                    {},
-                    withGuestOrderHeaders({}, pin, { clientId: ensureGuestClientId() })
-                );
+                var headers = withGuestOrderHeaders({}, pin, { clientId: ensureGuestClientId() });
+                return guestSessionCall(shopId, function (gateHttp, publicId) {
+                    return gateHttp.post(
+                        core.withQuery(gateGuestPaths.registerGuestRoster(sessionId), { shopPublicId: publicId }),
+                        {},
+                        headers
+                    );
+                }, function () {
+                    return http.post(
+                        core.withQuery(guestPaths.registerGuestRoster(sessionId), query),
+                        {},
+                        headers
+                    );
+                });
             },
             confirmGuestPeoples: function (sessionId, pin, peoples, shopId) {
                 var query = applyConnectShopScope({}, shopId);
-                return http.post(
-                    core.withQuery(guestPaths.confirmGuestPeoples(sessionId), query),
-                    { peoples: Number(peoples) },
-                    withGuestOrderHeaders({}, pin, { clientId: ensureGuestClientId() })
-                );
+                var headers = withGuestOrderHeaders({}, pin, { clientId: ensureGuestClientId() });
+                var body = { peoples: Number(peoples) };
+                return guestSessionCall(shopId, function (gateHttp, publicId) {
+                    return gateHttp.post(
+                        core.withQuery(gateGuestPaths.confirmGuestPeoples(sessionId), { shopPublicId: publicId }),
+                        body,
+                        headers
+                    );
+                }, function () {
+                    return http.post(
+                        core.withQuery(guestPaths.confirmGuestPeoples(sessionId), query),
+                        body,
+                        headers
+                    );
+                });
             },
             /**
              * 来客スタッフ依頼（CALL / CHECKOUT）。
@@ -4977,11 +5094,21 @@
              */
             raiseStaffRequest: function (sessionId, pin, type, shopId) {
                 var query = applyConnectShopScope({}, shopId);
-                return http.post(
-                    core.withQuery(guestPaths.staffRequest(sessionId), query),
-                    { type: String(type || '').trim().toUpperCase() },
-                    withGuestOrderHeaders({}, pin, { clientId: ensureGuestClientId() })
-                );
+                var body = { type: String(type || '').trim().toUpperCase() };
+                var headers = withGuestOrderHeaders({}, pin, { clientId: ensureGuestClientId() });
+                return guestSessionCall(shopId, function (gateHttp, publicId) {
+                    return gateHttp.post(
+                        core.withQuery(gateGuestPaths.staffRequest(sessionId), { shopPublicId: publicId }),
+                        body,
+                        headers
+                    );
+                }, function () {
+                    return http.post(
+                        core.withQuery(guestPaths.staffRequest(sessionId), query),
+                        body,
+                        headers
+                    );
+                });
             },
             /** 接続後に履歴だけ補完。UI は待たない。1 時間キャッシュ、注文後は forceRefresh。 */
             fillConnectOrderHistory: function (detail, sessionId, pin, shopId, options) {
@@ -5033,33 +5160,38 @@
                         return detail;
                     });
             },
-            joinSession: function (joinToken) {
-                return http.get(guestPaths.joinSession(joinToken));
+            joinSession: function (joinToken, shopId) {
+                return getGuestJoinInfo(joinToken, shopId);
             },
             openFixedQrSession: function (payload) {
-                return http.post(
-                    guestPaths.openFixedQrSession(),
-                    payload || {},
-                    withGuestOrderHeaders({}, null, { clientId: ensureGuestClientId() })
-                );
+                var body = payload || {};
+                var headers = withGuestOrderHeaders({}, null, { clientId: ensureGuestClientId() });
+                var openOnServer = function () {
+                    return http.post(guestPaths.openFixedQrSession(), body, headers);
+                };
+                var publicId = gateSessionHttp ? shopPublicIdForConnectQuery(body.shopId) : null;
+                if (!publicId) {
+                    return openOnServer();
+                }
+                // 開始は副作用あり。Worker まで届いていない（WAF/HTML）と確実に言えるときだけ VPS へ。
+                return gateSessionHttp.post(gateGuestPaths.openFixedQrSession(), body, headers)
+                    .catch(function (err) {
+                        var code = err && err.payload && err.payload.code;
+                        if (code === 'UNEXPECTED_HTML' || code === 'CF_CHALLENGE') {
+                            return openOnServer();
+                        }
+                        throw err;
+                    });
             },
             connectSessionViaJoinToken: function (joinToken, pin, shopId) {
-                return http.get(guestPaths.joinSession(joinToken))
+                return getGuestJoinInfo(joinToken, shopId)
                     .then(function (joinInfo) {
                         var sessionId = joinInfo && joinInfo.sessionId;
                         var normalizedPin = normalizeJoinPin(pin);
                         if (!sessionId || !normalizedPin) {
                             throw new Error('合流後は PIN が必要です');
                         }
-                        return http.get(
-                            core.withQuery(
-                                guestPaths.connectSession(sessionId),
-                                (function () {
-                                    return applyConnectShopScope({}, shopId);
-                                })()
-                            ),
-                            withGuestOrderHeaders({}, normalizedPin, { clientId: ensureGuestClientId() })
-                        ).then(function (session) {
+                        return getGuestConnectSession(sessionId, normalizedPin, shopId).then(function (session) {
                             return parseSessionConnect(session, sessionId, normalizedPin);
                         });
                     });
@@ -5121,17 +5253,24 @@
                 postBody.couponCodes = guestMeta && Array.isArray(guestMeta.couponCodes)
                     ? guestMeta.couponCodes.slice()
                     : [];
-                var promise = http.post(
-                    guestPaths.submitOrder(sid),
-                    postBody,
-                    withGuestOrderHeaders({
-                        // HA 切替の一瞬 502/ネットワーク切れを隠し、同一 Idempotency-Key で再送
-                        retry: { retries: 1, baseDelayMs: 250, maxDelayMs: 800 }
-                    }, normalizedPin, {
-                        clientId: plan.clientId,
-                        idempotencyKey: plan.requestId
-                    })
-                ).then(function (body) {
+                var orderHeaders = withGuestOrderHeaders({
+                    // HA 切替の一瞬 502/ネットワーク切れを隠し、同一 Idempotency-Key で再送
+                    retry: { retries: 1, baseDelayMs: 250, maxDelayMs: 800 }
+                }, normalizedPin, {
+                    clientId: plan.clientId,
+                    idempotencyKey: plan.requestId
+                });
+                // Gate と VPS は同じ orders.place の冪等キー（shopId:sessionId:Idempotency-Key）を使うので、
+                // Gate 障害で VPS に回しても二重注文にならない。
+                var promise = guestSessionCall(guestMeta && guestMeta.shopId, function (gateHttp, publicId) {
+                    return gateHttp.post(
+                        core.withQuery(gateGuestPaths.placeOrder(sid), { shopPublicId: publicId }),
+                        postBody,
+                        orderHeaders
+                    );
+                }, function () {
+                    return http.post(guestPaths.submitOrder(sid), postBody, orderHeaders);
+                }).then(function (body) {
                     var result = normalizeGuestOrderSubmitResult(body, plan.requestId);
                     if (!result) {
                         return body;
@@ -5664,13 +5803,21 @@
                     if (typeof document !== 'undefined' && document.hidden) {
                         return Promise.resolve(null);
                     }
-                    return http.get(
-                        core.withQuery(
-                            guestPaths.connectSession(activeSessionId),
-                            activeShopId != null && activeShopId !== '' ? { shopId: activeShopId } : {}
-                        ),
-                        withGuestOrderHeaders({}, activePin, { clientId: ensureGuestClientId() })
-                    )
+                    var resyncHeaders = withGuestOrderHeaders({}, activePin, { clientId: ensureGuestClientId() });
+                    return guestSessionCall(activeShopId, function (gateHttp, publicId) {
+                        return gateHttp.get(
+                            core.withQuery(gateGuestPaths.connectSession(activeSessionId), { shopPublicId: publicId }),
+                            resyncHeaders
+                        );
+                    }, function () {
+                        return http.get(
+                            core.withQuery(
+                                guestPaths.connectSession(activeSessionId),
+                                activeShopId != null && activeShopId !== '' ? { shopId: activeShopId } : {}
+                            ),
+                            resyncHeaders
+                        );
+                    })
                         .then(function (session) {
                             const detail = parseSessionConnect(session, activeSessionId, activePin);
                             if (typeof monitorOptions.onSessionUpdate === 'function') {
@@ -5722,11 +5869,14 @@
         var pathShopSlug = guestRouteShopSlug(route);
         var hashBody = String(parsed.hash || '').replace(/^#/, '');
         var hashParams = new URLSearchParams(hashBody.charAt(0) === '?' ? hashBody : (hashBody ? '?' + hashBody : ''));
+        var sharePath = isGuestShareJoinPath(parsed);
         var joinToken = (parsed.searchParams.get(JOIN_TOKEN_PARAM) || hashParams.get(JOIN_TOKEN_PARAM) || '').trim();
         if (joinToken) {
             return { kind: 'join', joinToken: joinToken, raw: raw, url: parsed, pathShopSlug: pathShopSlug };
         }
-        var fixed = parseFixedQrCredentialsFromSearch(parsed.search, parsed.pathname);
+        var fixed = sharePath
+            ? { shopId: '', tableNo: 0, passPhrase: '' }
+            : parseFixedQrCredentialsFromSearch(parsed.search, parsed.pathname);
         if (fixed.shopId && fixed.tableNo > 0 && fixed.passPhrase) {
             return {
                 kind: 'fixed',
@@ -6317,9 +6467,14 @@
             title.textContent = shopName;
             var sub = document.createElement('p');
             sub.className = 'mo-fixed-qr-entry-sub';
-            sub.textContent = tableNo > 0
-                ? ('テーブル ' + tableNo + ' — 人数を選んで注文を開始してください')
-                : '人数を選んで注文を開始してください';
+            var isSessionMode = !!(creds.sessionId && creds.pin);
+            sub.textContent = isSessionMode
+                ? (tableNo > 0
+                    ? ('テーブル ' + tableNo + ' — 人数を確定して合流してください')
+                    : '人数を確定して合流してください')
+                : (tableNo > 0
+                    ? ('テーブル ' + tableNo + ' — 人数を選んで注文を開始してください')
+                    : '人数を選んで注文を開始してください');
             var label = document.createElement('p');
             label.className = 'mo-fixed-qr-entry-label';
             label.textContent = '人数';
@@ -6365,7 +6520,7 @@
             var submit = document.createElement('button');
             submit.type = 'button';
             submit.className = 'mo-fixed-qr-entry-submit';
-            submit.textContent = '注文を開始';
+            submit.textContent = isSessionMode ? '人数を確定して合流' : '注文を開始';
             submit.addEventListener('click', function () {
                 void submitPeoples();
             });
@@ -7522,6 +7677,8 @@
         guestRouteShopSlug: guestRouteShopSlug,
         buildShopScopedScanPath: buildShopScopedScanPath,
         buildShopScopedGuestPath: buildShopScopedGuestPath,
+        buildShopScopedGuestSharePath: buildShopScopedGuestSharePath,
+        isGuestShareJoinPath: isGuestShareJoinPath,
         buildShopScopedGuestUrl: buildShopScopedGuestUrl,
         buildShopScopedScanUrl: buildShopScopedScanUrl,
         GUEST_SHOP_PATH_PREFIX: GUEST_SHOP_PATH_PREFIX,

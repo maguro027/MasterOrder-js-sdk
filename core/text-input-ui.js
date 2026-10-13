@@ -8,6 +8,7 @@
     var LIMITS = {
         displayText: 35,
         shortLabel: 64,
+        personName: 20,
         shopName: 120,
         plainMemo: 1000,
         sessionMemo: 500
@@ -24,6 +25,9 @@
         var api = policyApi();
         if (!api) {
             return { ok: true, reason: null };
+        }
+        if (opts.personName === true && api && typeof api.personName === 'function') {
+            return api.personName(value);
         }
         if (typeof api.validateSingleLine === 'function' && !multiline) {
             return api.validateSingleLine(value, maxLength);
@@ -74,6 +78,9 @@
         if (result.reason === 'length') {
             return fieldLabel + 'は' + maxLength + '文字以内で入力してください';
         }
+        if (result.reason === 'symbol') {
+            return fieldLabel + 'に使用できない文字が含まれています';
+        }
         return fieldLabel + 'に使用できない制御文字が含まれています';
     }
 
@@ -93,8 +100,8 @@
         requireValid: requireValid,
         toastMessage: toastMessage,
         bindStaffProfileInputs: function (elements) {
-            bindInput(elements.familyName, { maxLength: LIMITS.shortLabel });
-            bindInput(elements.givenName, { maxLength: LIMITS.shortLabel });
+            bindInput(elements.familyName, { maxLength: LIMITS.personName, personName: true });
+            bindInput(elements.givenName, { maxLength: LIMITS.personName, personName: true });
         },
         bindStaffShopCreateInput: function (input) {
             bindInput(input, { maxLength: LIMITS.shopName });

@@ -269,8 +269,8 @@ if (!result.stale) {
 |----------|------|
 | `getPendingOrders(shopId)` | 未提供注文 |
 | `markOrderServed(orderId)` | 提供済み |
-| `connectShopOrderEvents(shopId, handler, handlers)` | SSE 接続 |
-| `closeOrderEvents()` | SSE 切断 |
+| `connectShopOrderEvents(shopId, handler, handlers)` | 即時通知に接続（Gate WebSocket、使えなければ VPS SSE） |
+| `closeOrderEvents()` | 即時通知を切断（両方） |
 
 ### メニュー・在庫・メンバー
 

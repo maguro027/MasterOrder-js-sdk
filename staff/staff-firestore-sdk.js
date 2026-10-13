@@ -455,13 +455,8 @@
             var prevCount = sameSession && prevActive.orderCount != null
                 ? Number(prevActive.orderCount)
                 : null;
-            // 未同期の欠落/「注文ありなのに ¥0」だけ保護。キャンセル等の正当な減額は通す。
-            var mergedTotal = nextTotal;
-            if (prevTotal != null && prevTotal > 0
-                && (nextTotal == null
-                    || (nextTotal === 0 && nextCount != null && nextCount > 0))) {
-                mergedTotal = prevTotal;
-            }
+            // 合計フィールドが欠落したときだけ直前値を残す。明示の 0 円（クーポン）は通す。
+            var mergedTotal = nextTotal != null ? nextTotal : prevTotal;
             var mergedCount = nextCount != null ? nextCount : prevCount;
             var mergedActive = Object.assign({}, active, {
                 totalAmount: mergedTotal,
@@ -500,43 +495,24 @@
                 orderCount: mergedCount,
                 detailsEnriched: mergedActive.detailsEnriched === true,
                 stickyReady: mergedActive.stickyReady === true,
-                // startTime/peoples/totalAmount>=0 だけでは ready にしない（¥0 誤表示の再発防止）
                 liveDetailsState: resolveLiveDetailsState(mergedActive)
             });
         });
     }
 
     /**
-     * Firestore 直読の合計が未同期（注文ありなのに 0）の間は loading を維持する。
-     * REST enrich 済み、または合計>0、または注文0件が明示された席のみ ready。
+     * 合計フィールドがある席は ready。0 円・マイナス（クーポンで会計 0）も含む。
+     * 合計が無く、注文件数も 0 と分かっていない席だけ loading（カードは「—」）。
      */
     function resolveLiveDetailsState(active) {
         if (!active) {
             return 'loading';
         }
         var total = active.totalAmount != null ? Number(active.totalAmount) : NaN;
+        if (Number.isFinite(total)) {
+            return 'ready';
+        }
         var orders = active.orderCount != null ? Number(active.orderCount) : NaN;
-        if (Number.isFinite(total) && total > 0) {
-            return 'ready';
-        }
-        // 正の合計を一度でも見ている場合は ¥0 未同期を ready 扱いにしない
-        if (active.stickyReady === true && !(active.orderCount != null && orders === 0)) {
-            return 'loading';
-        }
-        if (active.detailsEnriched === true) {
-            // enrich 済みでも total=0 かつ orderCount 不明は loading（誤 ¥0 防止）
-            if (active.orderCount != null && orders === 0) {
-                return 'ready';
-            }
-            if (Number.isFinite(total) && total === 0 && active.orderCount != null && orders === 0) {
-                return 'ready';
-            }
-            if (!Number.isFinite(total) || total === 0) {
-                return 'loading';
-            }
-            return 'ready';
-        }
-        // 明示的に orderCount===0 のときだけ ¥0 を確定表示（フィールド欠落は loading）
         if (active.orderCount != null && orders === 0) {
             return 'ready';
         }
@@ -623,9 +599,7 @@
                     var nextTotal = next.totalAmount != null ? Number(next.totalAmount) : null;
                     var prevCount = prev.orderCount != null ? Number(prev.orderCount) : null;
                     var nextCount = next.orderCount != null ? Number(next.orderCount) : null;
-                    if (prevTotal != null && prevTotal > 0
-                        && (nextTotal == null
-                            || (nextTotal === 0 && nextCount != null && nextCount > 0))) {
+                    if (nextTotal == null && prevTotal != null) {
                         next.totalAmount = prevTotal;
                     }
                     if (nextCount == null && prevCount != null) {
@@ -682,16 +656,11 @@
                 var prevTotal = prev.totalAmount != null ? Number(prev.totalAmount) : null;
                 var nextCount = session.orderCount != null ? Number(session.orderCount) : null;
                 var prevCount = prev.orderCount != null ? Number(prev.orderCount) : null;
-                var prevReady = prev.detailsEnriched === true
-                    || (prevTotal != null && prevTotal > 0)
-                    || (prev.orderCount != null && prevCount === 0);
-                // 初回注文で orderCount だけ先に増え total がまだ 0 のとき、ready→loading に落とさない
-                var demoteRisk = prevReady
-                    && (nextTotal == null || nextTotal === 0)
-                    && nextCount != null && nextCount > 0;
-                // 欠落・一時的 ¥0（注文あり）のみ保護。キャンセル等の減額・件数減は通す。
-                var protectTotals = demoteRisk
-                    || (nextTotal == null && prevTotal != null && prevTotal > 0);
+                // 合計フィールドの欠落だけ直前値を残す。明示の 0 円はクーポン結果として通す。
+                var demoteRisk = nextTotal == null
+                    && nextCount !== 0
+                    && prevTotal != null;
+                var protectTotals = demoteRisk;
                 // 作成直後の REST PIN を Firestore 空 entryPin で消さない
                 var keepPin = !session.entryPin && prev.entryPin;
                 var keepJoin = !session.joinToken && prev.joinToken;
@@ -699,15 +668,9 @@
                     return session;
                 }
                 return Object.assign({}, session, {
-                    totalAmount: (function () {
-                        if (demoteRisk && (nextTotal == null || nextTotal === 0)) {
-                            return prevTotal != null ? prevTotal : 0;
-                        }
-                        if (nextTotal == null && prevTotal != null) {
-                            return prevTotal;
-                        }
-                        return nextTotal != null ? nextTotal : (prevTotal != null ? prevTotal : 0);
-                    }()),
+                    totalAmount: nextTotal != null
+                        ? nextTotal
+                        : (prevTotal != null ? prevTotal : 0),
                     orderCount: nextCount != null ? nextCount : (prevCount != null ? prevCount : 0),
                     detailsEnriched: protectTotals ? prev.detailsEnriched === true : !!prev.detailsEnriched,
                     stickyReady: protectTotals
@@ -786,11 +749,6 @@
                 var mergedTotal = itemTotal;
                 if (mergedTotal == null) {
                     mergedTotal = prevTotal != null ? prevTotal : 0;
-                } else if (prevTotal != null && prevTotal > 0
-                    && mergedTotal === 0
-                    && !(itemCount === 0)) {
-                    // REST が一瞬 ¥0 を返しても直前の正の合計を維持
-                    mergedTotal = prevTotal;
                 }
                 var mergedCount = itemCount;
                 if (mergedCount == null) {

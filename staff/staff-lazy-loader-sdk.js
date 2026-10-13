@@ -7,7 +7,7 @@
     'use strict';
 
     var VERSION = '1.0.0';
-    var DEFAULT_BUNDLE_VERSION = 'staff-bundle-295';
+    var DEFAULT_BUNDLE_VERSION = 'staff-bundle-382';
     var loadingByKey = {};
 
     function bundleVersion() {

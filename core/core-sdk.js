@@ -1233,6 +1233,12 @@
         var termsAcceptedAt = raw.termsAcceptedAt || null;
         var termsAccepted = raw.termsAccepted === true
             || (termsAcceptedAt != null && String(termsAcceptedAt).trim() !== '');
+        var accountTypeRaw = raw.accountType != null ? raw.accountType : raw.account_type;
+        var accountType = String(accountTypeRaw || '').trim().toUpperCase();
+        if (accountType !== 'OWNER' && accountType !== 'ADMIN' && accountType !== 'STAFF') {
+            accountType = null;
+        }
+        var canCreateRaw = raw.canCreateShop != null ? raw.canCreateShop : raw.can_create_shop;
         return {
             familyName: raw.familyName || null,
             givenName: raw.givenName || null,
@@ -1241,7 +1247,11 @@
             publicId: raw.publicId || null,
             firebaseUid: raw.firebaseUid || raw.userId || null,
             termsAccepted: termsAccepted,
-            termsAcceptedAt: termsAcceptedAt
+            termsAcceptedAt: termsAcceptedAt,
+            accountType: accountType,
+            shopSlots: Number(raw.shopSlots != null ? raw.shopSlots : raw.shop_slots) || 0,
+            ownedShopCount: Number(raw.ownedShopCount != null ? raw.ownedShopCount : raw.owned_shop_count) || 0,
+            canCreateShop: canCreateRaw === true
         };
     }
 
@@ -1274,13 +1284,17 @@
     /**
      * ユーザープロフィール API（Staff / Order 共通 — Firebase 認証付き HTTP が前提）。
      * @param {ReturnType<typeof createHttpClient>} http
-     * @param {{ myProfile: function, updateMyProfile: function, setMyPublicId: function }} pathBuilders
+     * @param {{ myProfile: function, updateMyProfile: function, setMyPublicId: function, checkMyPublicId?: function }} pathBuilders
      */
     function createProfileApi(http, pathBuilders) {
         var paths = pathBuilders || {};
 
-        function getMyProfile() {
-            return http.get(paths.myProfile()).then(normalizeUserProfile);
+        function getMyProfile(callOptions) {
+            var path = paths.myProfile();
+            if (callOptions && callOptions.recordLogin) {
+                path += (path.indexOf('?') >= 0 ? '&' : '?') + 'login=1';
+            }
+            return http.get(path).then(normalizeUserProfile);
         }
 
         function updateMyProfile(payload) {
@@ -1300,6 +1314,15 @@
                 method: 'PATCH',
                 body: JSON.stringify({ publicId: String(publicId || '').trim() })
             }).then(normalizeUserProfile);
+        }
+
+        function checkPublicId(publicId) {
+            if (typeof paths.checkMyPublicId !== 'function') {
+                return Promise.reject(Object.assign(new Error('checkMyPublicId not configured'), {
+                    status: 501
+                }));
+            }
+            return http.get(paths.checkMyPublicId(publicId));
         }
 
         /**
@@ -1328,11 +1351,20 @@
             });
         }
 
+        function redeemPromotion(code) {
+            return http.request('/auth/me/promotions/redeem', {
+                method: 'POST',
+                body: JSON.stringify({ code: String(code || '').trim() })
+            });
+        }
+
         return {
             getMyProfile: getMyProfile,
             updateMyProfile: updateMyProfile,
             setMyPublicId: setMyPublicId,
-            saveProfile: saveProfile
+            checkPublicId: checkPublicId,
+            saveProfile: saveProfile,
+            redeemPromotion: redeemPromotion
         };
     }
 
@@ -1537,6 +1569,202 @@
         };
     }
 
+    /**
+     * Gate のスタッフ向け WebSocket（/v1/staff-events/ws）。createSseClient と同じハンドルを返す。
+     * getReadyState は EventSource の定数で返す（staff-shell が EventSource.OPEN と比べるため）。
+     * サーバーは文字列 ping に pong を返すだけ。メッセージは全て order-update 相当の JSON。
+     */
+    function createWebSocketEventsClient(options) {
+        const opts = options || {};
+        const reconnectDelayMs = opts.reconnectDelayMs > 0 ? opts.reconnectDelayMs : 5000;
+        const maxReconnectDelayMs = opts.maxReconnectDelayMs > 0 ? opts.maxReconnectDelayMs : 120000;
+        const minReconnectGapMs = opts.minReconnectGapMs > 0 ? opts.minReconnectGapMs : 15000;
+        const staleTimeoutMs = opts.staleTimeoutMs > 0 ? opts.staleTimeoutMs : 90000;
+        const pingIntervalMs = opts.pingIntervalMs > 0 ? opts.pingIntervalMs : 25000;
+        let socket = null;
+        let timer = null;
+        let pingTimer = null;
+        let activeParams = null;
+        let reconnectAttempts = 0;
+        let lastActivityAt = 0;
+        let lastNamedEventAt = 0;
+
+        function markActivity() {
+            lastActivityAt = Date.now();
+            reconnectAttempts = 0;
+        }
+
+        function clearTimers() {
+            if (timer) {
+                clearTimeout(timer);
+                timer = null;
+            }
+            if (pingTimer) {
+                clearInterval(pingTimer);
+                pingTimer = null;
+            }
+        }
+
+        function closeSocketOnly() {
+            if (pingTimer) {
+                clearInterval(pingTimer);
+                pingTimer = null;
+            }
+            if (socket) {
+                const s = socket;
+                socket = null;
+                s.onopen = null;
+                s.onmessage = null;
+                s.onerror = null;
+                s.onclose = null;
+                try {
+                    s.close(1000, 'client close');
+                } catch (_) { /* already closed */ }
+            }
+        }
+
+        function close() {
+            clearTimers();
+            closeSocketOnly();
+            activeParams = null;
+            reconnectAttempts = 0;
+            lastActivityAt = 0;
+            lastNamedEventAt = 0;
+        }
+
+        function scheduleReconnect() {
+            if (!activeParams) {
+                return;
+            }
+            clearTimers();
+            const backoff = Math.min(
+                reconnectDelayMs * Math.pow(2, Math.min(reconnectAttempts, 5)),
+                maxReconnectDelayMs
+            );
+            const delay = Math.max(minReconnectGapMs, backoff);
+            reconnectAttempts += 1;
+            timer = setTimeout(function () {
+                timer = null;
+                connectAsync(activeParams).catch(function () {
+                    scheduleReconnect();
+                });
+            }, delay);
+        }
+
+        function forceReconnect() {
+            if (!activeParams) {
+                return Promise.resolve();
+            }
+            closeSocketOnly();
+            return connectAsync(activeParams).catch(function () {
+                scheduleReconnect();
+            });
+        }
+
+        function startPing() {
+            if (pingTimer) {
+                clearInterval(pingTimer);
+            }
+            pingTimer = setInterval(function () {
+                if (!socket || socket.readyState !== WebSocket.OPEN) {
+                    return;
+                }
+                if (lastActivityAt && Date.now() - lastActivityAt > staleTimeoutMs) {
+                    forceReconnect();
+                    return;
+                }
+                try {
+                    socket.send('ping');
+                } catch (_) { /* onclose handles it */ }
+            }, pingIntervalMs);
+        }
+
+        function readyState() {
+            if (!socket) {
+                return EventSource.CLOSED;
+            }
+            if (socket.readyState === WebSocket.OPEN) {
+                return EventSource.OPEN;
+            }
+            return socket.readyState === WebSocket.CONNECTING ? EventSource.CONNECTING : EventSource.CLOSED;
+        }
+
+        function buildConnectionHandle() {
+            return {
+                close: close,
+                getReadyState: readyState,
+                getLastActivityAt: function () {
+                    return lastActivityAt;
+                },
+                getLastNamedEventAt: function () {
+                    return lastNamedEventAt;
+                },
+                forceReconnect: forceReconnect
+            };
+        }
+
+        /** @param {{ fetchUrl: function(): Promise<string>, onMessage?: function({data:string}), onOpen?: function(*), onError?: function(*) }} params */
+        async function connectAsync(params) {
+            clearTimers();
+            closeSocketOnly();
+            activeParams = params;
+            const url = await params.fetchUrl();
+            if (!url) {
+                throw new Error('MasterOrderCoreSdk: WebSocket URL missing');
+            }
+            if (activeParams !== params) {
+                return buildConnectionHandle();
+            }
+            const s = new WebSocket(url);
+            socket = s;
+            s.onopen = function (event) {
+                markActivity();
+                startPing();
+                if (params.onOpen) {
+                    params.onOpen(event);
+                }
+            };
+            s.onmessage = function (event) {
+                markActivity();
+                const data = event && event.data != null ? String(event.data) : '';
+                if (data === 'pong') {
+                    return;
+                }
+                lastNamedEventAt = Date.now();
+                if (params.onMessage) {
+                    params.onMessage({ data: data });
+                }
+            };
+            s.onclose = function (event) {
+                if (socket !== s) {
+                    return;
+                }
+                socket = null;
+                if (pingTimer) {
+                    clearInterval(pingTimer);
+                    pingTimer = null;
+                }
+                if (params.onError) {
+                    params.onError(event);
+                }
+                scheduleReconnect();
+            };
+            return buildConnectionHandle();
+        }
+
+        return {
+            connectAsync: connectAsync,
+            close: close,
+            forceReconnect: forceReconnect,
+            getLastActivityAt: function () {
+                return lastActivityAt;
+            },
+            getLastNamedEventAt: function () {
+                return lastNamedEventAt;
+            }
+        };
+    }
+
     global.MasterOrderCoreSdk = {
         VERSION: SDK_VERSION,
         getApiRoutes: function () {
@@ -1555,6 +1783,7 @@
         createAccountStateApi: createAccountStateApi,
         createProfileApi: createProfileApi,
         createSseClient: createSseClient,
+        createWebSocketEventsClient: createWebSocketEventsClient,
         buildProfileFullName: buildProfileFullName,
         resolveDisplayFamilyName: resolveDisplayFamilyName,
         normalizeUserProfile: normalizeUserProfile,

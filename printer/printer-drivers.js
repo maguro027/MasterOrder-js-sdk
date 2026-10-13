@@ -86,12 +86,22 @@
         var data = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
         var rows = [];
         var i = 0;
+        var pendingBand = 0;
+        var lineSpacing = 24;
 
         function blank(count) {
             var n = Math.max(0, count | 0);
             var r;
             for (r = 0; r < n; r += 1) {
                 rows.push(new Uint8Array(width));
+            }
+        }
+
+        function consumeFeed(dots) {
+            var extra = (dots | 0) - pendingBand;
+            pendingBand = 0;
+            if (extra > 0) {
+                blank(extra);
             }
         }
 
@@ -120,28 +130,42 @@
                         }
                     }
                 }
+                pendingBand = bandH;
                 continue;
             }
             if (b === 0x1b && i + 1 < data.length && data[i + 1] === 0x40) {
+                pendingBand = 0;
                 i += 2;
                 continue;
             }
+            if (b === 0x1b && i + 1 < data.length && data[i + 1] === 0x32) {
+                lineSpacing = 24;
+                i += 2;
+                continue;
+            }
+            if (b === 0x1b && i + 2 < data.length && data[i + 1] === 0x33) {
+                lineSpacing = data[i + 2] | 0;
+                i += 3;
+                continue;
+            }
             if (b === 0x1b && i + 2 < data.length && data[i + 1] === 0x4a) {
-                blank(data[i + 2]);
+                consumeFeed(data[i + 2]);
                 i += 3;
                 continue;
             }
             if (b === 0x1b && i + 2 < data.length && data[i + 1] === 0x64) {
+                pendingBand = 0;
                 blank((data[i + 2] | 0) * 24);
                 i += 3;
                 continue;
             }
             if (b === 0x1d && i + 1 < data.length && data[i + 1] === 0x56) {
+                pendingBand = 0;
                 i += (i + 2 < data.length && data[i + 2] >= 65) ? 4 : 3;
                 continue;
             }
             if (b === 0x0a || b === 0x0d) {
-                blank(24);
+                consumeFeed(lineSpacing);
                 i += 1;
                 continue;
             }
@@ -342,7 +366,7 @@
     }
 
     function shouldFallbackToOsPrint(err, ctx) {
-        if (ctx && (ctx.calibrate || ctx.keepBursts || ctx.mode === 'windows-driver')) {
+        if (ctx && (ctx.calibrate || ctx.keepBursts || ctx.kitchenTicket || ctx.mode === 'windows-driver')) {
             return false;
         }
         if (typeof P.isNativePlatform === 'function' && P.isNativePlatform()) {
@@ -394,7 +418,48 @@
         await postLanXml(url, xml, 'text/xml; charset=utf-8');
     }
 
+    async function printBrowserLan(target, bytesOrParts, ctx) {
+        var host = String(target && target.host || '').trim();
+        var port = Number(target && target.port) || 9100;
+        var bytes = partsToBytes(bytesOrParts);
+        if (host) {
+            var base = 'http://' + host;
+            if (port && port !== 80 && port !== 9100) {
+                base += ':' + port;
+            }
+            try {
+                await printViaStarLan(bytes, normalizeLanUrl(base, 'star'));
+                return;
+            } catch (_star) {
+                try {
+                    await printViaEpsonLan(bytes, normalizeLanUrl(base, 'epson'));
+                    return;
+                } catch (_epson) {
+                    /* HTTPS のページから LAN の http へ届かない。Windows の一覧へ。 */
+                }
+            }
+        }
+        if (ctx && ctx.kitchenTicket) {
+            throw new Error('LAN プリンタに届きませんでした。厨房モードでは確認画面を開きません。');
+        }
+        if (typeof console !== 'undefined' && console.info) {
+            console.info('[escpos] PC LAN uses Windows print dialog', host, port);
+        }
+        return printViaWindowsDriver(bytesOrParts);
+    }
+
     async function printOfficialReceipt(bytesOrParts, ctx) {
+        var saved = typeof P.getDefaultPrinter === 'function' ? P.getDefaultPrinter() : null;
+        var native = typeof P.supportsNativePrinter === 'function' && P.supportsNativePrinter();
+        if (ctx && ctx.kitchenTicket && (!saved || saved.transport === 'os')) {
+            throw new Error('厨房モードでは、確認画面が出ないプリンタを選んでください。');
+        }
+        if (saved && saved.transport === 'os') {
+            return printViaWindowsDriver(bytesOrParts);
+        }
+        if (saved && saved.transport === 'tcp' && !native) {
+            return printBrowserLan(saved, bytesOrParts, ctx);
+        }
         var info = getActivePrintPath(ctx);
         if (typeof console !== 'undefined' && console.info) {
             console.info('[escpos] driver=', info.mode, 'path=', info.path, info.url || '');
@@ -402,11 +467,15 @@
         var mode = info.mode;
         if (mode === 'windows-driver') {
             var def = typeof P.getDefaultPrinter === 'function' ? P.getDefaultPrinter() : null;
-            if (def && (def.transport === 'usb' || def.transport === 'serial' || def.transport === 'bluetooth')) {
+            if (def && (def.transport === 'usb' || def.transport === 'serial' || def.transport === 'bluetooth'
+                || (ctx && ctx.kitchenTicket && def.transport === 'tcp'))) {
                 if (typeof console !== 'undefined' && console.info) {
                     console.info('[escpos] windows-driver skipped; default ESC/POS printer is set');
                 }
                 return sendManual(bytesOrParts, ctx);
+            }
+            if (ctx && ctx.kitchenTicket) {
+                throw new Error('厨房モードでは、確認画面が出ないプリンタを選んでください。');
             }
             return printViaWindowsDriver(bytesOrParts);
         }
@@ -427,6 +496,14 @@
         try {
             return await sendManual(bytesOrParts, ctx);
         } catch (err) {
+            var msg = String(err && err.message ? err.message : err || '');
+            if (msg === 'LAN_BROWSER') {
+                var lan = typeof P.getDefaultPrinter === 'function' ? P.getDefaultPrinter() : null;
+                return printBrowserLan(lan || {}, bytesOrParts);
+            }
+            if (msg === 'OS_PRINT') {
+                return printViaWindowsDriver(bytesOrParts);
+            }
             if (shouldFallbackToOsPrint(err, ctx)) {
                 if (typeof console !== 'undefined' && console.info) {
                     console.info('[escpos] mobile fallback to OS print dialog');

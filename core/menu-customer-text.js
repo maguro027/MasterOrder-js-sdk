@@ -50,6 +50,42 @@
         return { ok: true, reason: null };
     }
 
+    var PERSON_NAME_MAX_LENGTH = 20;
+
+    function isPersonNameSpacer(codePoint) {
+        return codePoint === 0x20
+            || codePoint === 0x30FB
+            || codePoint === 0x00B7
+            || codePoint === 0x002D
+            || codePoint === 0x2010
+            || codePoint === 0x2011;
+    }
+
+    function validatePersonName(value) {
+        var text = String(value ?? '').trim();
+        if (!text) {
+            return { ok: true, reason: null };
+        }
+        var chars = Array.from(text);
+        if (chars.length > PERSON_NAME_MAX_LENGTH) {
+            return { ok: false, reason: 'length' };
+        }
+        var previousSpacer = false;
+        for (var i = 0; i < chars.length; i++) {
+            var cp = chars[i].codePointAt(0);
+            var spacer = isPersonNameSpacer(cp);
+            var letter = /^[\p{L}\p{M}]$/u.test(chars[i]);
+            if (isForbiddenControl(cp, false) || (!letter && !spacer)) {
+                return { ok: false, reason: 'symbol' };
+            }
+            if (spacer && (i === 0 || i === chars.length - 1 || previousSpacer)) {
+                return { ok: false, reason: 'symbol' };
+            }
+            previousSpacer = spacer;
+        }
+        return { ok: true, reason: null };
+    }
+
     function validateName(value) {
         return validate(value, NAME_MAX_LENGTH, false);
     }
@@ -130,6 +166,9 @@
         },
         shortLabel: function (value) {
             return validate(value, 64, false);
+        },
+        personName: function (value) {
+            return validatePersonName(value);
         },
         shopName: function (value) {
             return validate(value, 120, false);

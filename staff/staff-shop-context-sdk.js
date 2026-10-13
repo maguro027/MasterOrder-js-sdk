@@ -127,7 +127,8 @@
                 var menus = Array.isArray(pair[0]) ? pair[0] : [];
                 var subscribe = pair[1];
                 var result = { menus: menus, subscribe: subscribe };
-                if (shopIsFree(subscribe)) {
+                // 購読が取れないときも無料扱いで在庫 GET しない。無料店は 403 になりコンソールに残る。
+                if (!subscribe || shopIsFree(subscribe)) {
                     return result;
                 }
                 // 在庫は管理メニュー取得時のみ（ログイン暖機や全店プリフェッチでは呼ばない）

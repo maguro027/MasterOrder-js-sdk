@@ -121,6 +121,7 @@
             setTableSeatSyncHint: hooks.setTableSeatSyncHint,
             finishRender: hooks.finishRender,
             getSessionListEl: cfg.getSessionListEl,
+            sessionListHasCards: hooks.sessionListHasCards,
             renderEmpty: hooks.renderEmpty,
             renderKiteiQr: hooks.renderKiteiQr,
             renderViewsNow: hooks.renderViewsNow,

@@ -7,7 +7,7 @@
 (function (global) {
     'use strict';
 
-    var SDK_VERSION = '1.3.7';
+    var SDK_VERSION = '1.5.0';
     var FILTER_HIDDEN_CLASS = 'table-seat-filter-hidden';
     var tableSeatElapsedTimerId = null;
     var tableSeatElapsedTimerRoot = null;
@@ -260,6 +260,7 @@
             String(seat.staffRequestType || ''),
             String(seat.staffRequestAt || ''),
             String(seat.totalAmount != null ? seat.totalAmount : ''),
+            String(seat.orderCount != null ? seat.orderCount : ''),
             String(seat.startTime || ''),
             String((seat.partyFlags && seat.partyFlags.family) ? '1' : '0'),
             String((seat.partyFlags && seat.partyFlags.couple) ? '1' : '0'),
@@ -424,7 +425,25 @@
             return true;
         }
 
+        function setTableQrPrintHint(tableNo) {
+            var hint = (opts.elements || {}).printHint;
+            if (!hint) {
+                return;
+            }
+            var n = Number(tableNo);
+            if (!Number.isInteger(n) || n < 1) {
+                hint.hidden = true;
+                if (hint.dataset) {
+                    delete hint.dataset.tableNo;
+                }
+                return;
+            }
+            hint.hidden = false;
+            hint.dataset.tableNo = String(n);
+        }
+
         function clearActionModalQrImage(els) {
+            setTableQrPrintHint(null);
             if (!els || !els.qrImg) {
                 return;
             }
@@ -459,29 +478,23 @@
 
         function resolveDisplayTotalAmount(seat, card) {
             var next = seat && seat.totalAmount != null ? Number(seat.totalAmount) : NaN;
+            // クーポンで 0 円、またはマイナスも確定値。直前の正の金額で上書きしない
+            if (Number.isFinite(next)) {
+                if (card && card.dataset) {
+                    if (next > 0) {
+                        card.dataset.lastPositiveAmount = String(next);
+                    } else {
+                        delete card.dataset.lastPositiveAmount;
+                    }
+                }
+                return next;
+            }
             var sticky = card && card.dataset
                 ? Number(card.dataset.lastPositiveAmount || '')
                 : NaN;
-            if (Number.isFinite(next) && next > 0) {
-                if (card && card.dataset) {
-                    card.dataset.lastPositiveAmount = String(next);
-                }
-                return next;
-            }
-            var orders = seat && seat.orderCount != null ? Number(seat.orderCount) : NaN;
-            if (Number.isFinite(next) && next === 0 && seat && seat.orderCount != null && orders === 0) {
-                if (card && card.dataset) {
-                    delete card.dataset.lastPositiveAmount;
-                }
-                return 0;
-            }
             if (Number.isFinite(sticky) && sticky > 0) {
                 return sticky;
             }
-            if (Number.isFinite(next)) {
-                return next;
-            }
-            // 新規セッション等: 合計未取得でも 0 円を出す（「—」非表示）
             return 0;
         }
 
@@ -557,41 +570,19 @@
                 return false;
             }
             var total = seat.totalAmount != null ? Number(seat.totalAmount) : NaN;
+            // フィールドがある数値は確定。クーポン後の 0 円も「—」にしない
+            if (Number.isFinite(total)) {
+                return false;
+            }
             var orders = seat.orderCount != null ? Number(seat.orderCount) : NaN;
+            if (seat.orderCount != null && orders === 0) {
+                return false;
+            }
             var sticky = card && card.dataset
                 ? Number(card.dataset.lastPositiveAmount || '')
                 : NaN;
-            // 誤 ¥0 のときは amountLayout 済みでも loading に戻す（高さより正しさ優先）
-            var suspiciousZero = (!Number.isFinite(total) || total === 0)
-                && !(seat.orderCount != null && orders === 0)
-                && seat.liveDetailsState === 'loading';
-            if (suspiciousZero) {
-                return true;
-            }
-            // 一度金額レイアウトを出したらバーに戻さない（高さジャンプ防止）
             if (card && card.dataset && card.dataset.amountLayout === '1'
-                && (Number.isFinite(total) && total > 0
-                    || (seat.orderCount != null && orders === 0)
-                    || (Number.isFinite(sticky) && sticky > 0))) {
-                return false;
-            }
-            if (seat.liveDetailsState === 'ready'
-                && (Number.isFinite(total) && total > 0
-                    || (seat.orderCount != null && orders === 0))) {
-                return false;
-            }
-            if (seat.detailsEnriched === true
-                && (Number.isFinite(total) && total > 0
-                    || (seat.orderCount != null && orders === 0))) {
-                return false;
-            }
-            if (seat.liveDetailsState === 'loading') {
-                return true;
-            }
-            if (Number.isFinite(total) && total > 0) {
-                return false;
-            }
-            if (seat.orderCount != null && orders === 0) {
+                && Number.isFinite(sticky) && sticky > 0) {
                 return false;
             }
             return true;
@@ -835,8 +826,13 @@
             if (typeof opts.applyFixedQrToWrap === 'function') {
                 var applied = opts.applyFixedQrToWrap(
                     els.qr, els.qrImg, els.qrCaption, tableNo, passPhrase, connectUrl);
-                if (!applied && els.qrCaption && !els.qrCaption.textContent) {
-                    els.qrCaption.textContent = '固定QRを生成できません';
+                if (applied) {
+                    setTableQrPrintHint(tableNo);
+                } else {
+                    setTableQrPrintHint(null);
+                    if (els.qrCaption && !els.qrCaption.textContent) {
+                        els.qrCaption.textContent = '固定QRを生成できません';
+                    }
                 }
             }
         }
@@ -933,19 +929,25 @@
             }
             if (typeof opts.applyJoinQrToWrap === 'function') {
                 Promise.resolve(opts.applyJoinQrToWrap(els.qr, els.qrImg, els.qrCaption, seat))
-                    .then(function () {
+                    .then(function (ok) {
                         if (loadSeq !== fixedQrModalLoadSeq) {
                             return;
                         }
                         setFixedQrLoading(els, false, null);
+                        if (!ok) {
+                            setTableQrPrintHint(null);
+                            return;
+                        }
                         if (els.qrCaption) {
                             els.qrCaption.textContent = 'セッションに参加できるQR';
                         }
+                        setTableQrPrintHint(null);
                     })
                     .catch(function () {
                         if (loadSeq !== fixedQrModalLoadSeq) {
                             return;
                         }
+                        setTableQrPrintHint(null);
                         setFixedQrLoading(els, true, 'QRを表示できません');
                         if (typeof opts.toast === 'function') {
                             opts.toast('注文QRの表示に失敗しました', 'error');

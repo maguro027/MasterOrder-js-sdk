@@ -122,6 +122,27 @@
         }
     }
 
+    var SESSION_EXPIRED_MESSAGE = 'ログインの有効期限が切れました。ページを再読み込みしてください。';
+
+    function staffAuthStatus(err) {
+        if (!err) {
+            return 0;
+        }
+        var status = Number(err.status || err.statusCode || 0);
+        if (status === 401 || status === 403) {
+            return status;
+        }
+        var msg = String(err.message || '');
+        var match = msg.match(/Gate assertion mint failed:\s*(40[13])/);
+        if (match) {
+            return Number(match[1]);
+        }
+        if (msg === 'id-token-timeout') {
+            return 401;
+        }
+        return 0;
+    }
+
     function staffUserVisibleLoadError(err, fallback, backoff) {
         logStaffError('load', err);
         var rateLimitCheck = backoff && typeof backoff.isRateLimitError === 'function'
@@ -129,6 +150,17 @@
             : createFirestoreBackoff().isRateLimitError;
         if (rateLimitCheck(err) || isHttpRateLimited(err)) {
             return formatStaffApiError(err, fallback || UNKNOWN_PROBLEM_MESSAGE, backoff);
+        }
+        var authStatus = staffAuthStatus(err);
+        if (authStatus === 401
+            || (authStatus === 403 && /Gate assertion mint failed/.test(String(err && err.message || '')))) {
+            return SESSION_EXPIRED_MESSAGE;
+        }
+        if (authStatus === 403) {
+            var denied = formatStaffApiError(err, '');
+            if (denied && denied !== '不明なエラー') {
+                return denied;
+            }
         }
         return fallback || UNKNOWN_PROBLEM_MESSAGE;
     }

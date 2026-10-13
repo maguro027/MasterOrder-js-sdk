@@ -34,9 +34,14 @@
             myShops: { method: 'GET', path: '/shops/my-shop', audience: 'staff' },
             createShop: { method: 'POST', path: '/shops', audience: 'staff' },
             myProfile: { method: 'GET', path: '/auth/me/profile', audience: 'staff' },
+            ownerCheckout: { method: 'POST', path: '/auth/me/owner-checkout', audience: 'staff', note: 'オーナー登録 ¥2,500 一回払い' },
+            shopSlotCheckout: { method: 'POST', path: '/auth/me/shop-slot-checkout', audience: 'staff', note: '追加店舗 ¥1,500 一回払い' },
             updateMyProfile: { method: 'PATCH', path: '/auth/me/profile', audience: 'staff' },
             setMyPublicId: { method: 'PATCH', path: '/auth/me/public-id', audience: 'staff' },
-            shopDashboard: { method: 'GET', path: '/shops/:shopId/dashboard', audience: 'staff', note: 'period / month / from / to（YYYY-MM-DD または YYYY-MM）' },
+            checkMyPublicId: { method: 'GET', path: '/auth/me/public-id/available', audience: 'staff' },
+            shopDashboard: { method: 'GET', path: '/shops/:shopId/dashboard', audience: 'staff', note: 'period / month / from / to（YYYY-MM-DD または YYYY-MM）。includeHourly は商品分析だけ' },
+            shopDashboardToday: { method: 'GET', path: '/shops/:shopId/dashboard/today', audience: 'staff', note: '今日の目標・未会計・現金カード' },
+            shopDashboardExport: { method: 'GET', path: '/shops/:shopId/dashboard/export.csv', audience: 'staff', note: 'MANAGER+。from/to または period。sections=daily,category,menu,topping' },
             shopDashboardMonths: { method: 'GET', path: '/shops/:shopId/dashboard/months', audience: 'staff' },
             shopCashDelta: {
                 method: 'GET',
@@ -109,6 +114,7 @@
             activeSessions: { method: 'GET', path: '/sessions/active', audience: 'staff', note: 'shopId, includeTotals' },
             createSession: { method: 'POST', path: '/sessions/create/:shopId', audience: 'staff' },
             checkoutSession: { method: 'POST', path: '/sessions/:sessionId/checkout', audience: 'staff' },
+            checkoutScriptPreview: { method: 'GET', path: '/sessions/:sessionId/checkout-script', audience: 'staff' },
             ackStaffRequest: {
                 method: 'POST',
                 path: '/sessions/:sessionId/staff-request/ack',
@@ -116,6 +122,12 @@
                 note: '来客 CALL/CHECKOUT 対応完了'
             },
             sessionDetail: { method: 'GET', path: '/sessions/:sessionId', audience: 'staff', note: 'includeOrders' },
+            sessionGuestLink: {
+                method: 'GET',
+                path: '/sessions/:sessionId/guest-link',
+                audience: 'staff',
+                note: '利用中のみ。SHOP_STAFF も接続操作で entryPin を得る'
+            },
             sessionMemo: { method: 'PATCH', path: '/sessions/:sessionId/memo', audience: 'staff' },
             sessionGuestCounts: {
                 method: 'PATCH',
@@ -125,6 +137,12 @@
             },
             archiveSessions: { method: 'GET', path: '/sessions/archive', audience: 'staff' },
             archiveSessionDetail: { method: 'GET', path: '/sessions/archive/:sessionId', audience: 'staff' },
+            archiveFormalReceipt: {
+                method: 'PATCH',
+                path: '/sessions/archive/:sessionId/formal-receipt',
+                audience: 'staff',
+                note: 'この会計だけの宛名と但し書き。端末には残さない'
+            },
             pendingOrders: { method: 'GET', path: '/orders/pending', audience: 'staff', note: 'shopId' },
             markOrderServed: { method: 'POST', path: '/orders/:orderId/served', audience: 'staff' },
             serveOrderLine: { method: 'POST', path: '/orders/:orderId/serve-line', audience: 'staff' },
@@ -256,6 +274,9 @@
                 audience: 'staff'
             },
             catalogUnpublished: { method: 'GET', path: '/shops/:shopId/catalog/unpublished', audience: 'staff' },
+            listMenuDrafts: { method: 'GET', path: '/shops/:shopId/catalog/drafts', audience: 'staff' },
+            saveMenuDraft: { method: 'PUT', path: '/shops/:shopId/catalog/drafts/:draftId', audience: 'staff' },
+            deleteMenuDraft: { method: 'DELETE', path: '/shops/:shopId/catalog/drafts/:draftId', audience: 'staff' },
             publishCatalog: { method: 'POST', path: '/shops/:shopId/catalog/publish', audience: 'staff' },
             shopSubscribe: { method: 'GET', path: '/shops/:shopId/subscribe', audience: 'staff' },
             billingCheckoutSession: {
@@ -335,8 +356,11 @@
 
         auth: {
             myProfile: { method: 'GET', path: '/auth/me/profile', audience: 'staff', note: 'Staff / 将来 Order（Firebase 認証）' },
+            ownerCheckout: { method: 'POST', path: '/auth/me/owner-checkout', audience: 'staff', note: 'オーナー登録 ¥2,500 一回払い' },
+            shopSlotCheckout: { method: 'POST', path: '/auth/me/shop-slot-checkout', audience: 'staff', note: '追加店舗 ¥1,500 一回払い' },
             updateMyProfile: { method: 'PATCH', path: '/auth/me/profile', audience: 'staff' },
             setMyPublicId: { method: 'PATCH', path: '/auth/me/public-id', audience: 'staff' },
+            checkMyPublicId: { method: 'GET', path: '/auth/me/public-id/available', audience: 'staff' },
             gateAssertion: { method: 'POST', path: '/auth/gate/assertion', audience: 'staff', note: 'Firebase ID token → Gate 短命アサーション' }
         },
 
@@ -375,7 +399,22 @@
             toppingGroupsForMenu: { method: 'GET', path: '/v1/guest/topping-groups/menus/:menuId', audience: 'guest', note: '要 shopPublicId UUID' },
             orderToppingCatalog: { method: 'GET', path: '/v1/guest/topping-groups/shops/:shopPublicId/order-catalog', audience: 'guest' },
             orderBundle: { method: 'GET', path: '/v1/guest/shops/:shopPublicId/order-bundle', audience: 'guest' },
-            pricingRevision: { method: 'GET', path: '/v1/guest/shops/:shopPublicId/pricing-revision', audience: 'guest', note: '軽量 pcr プローブ' }
+            pricingRevision: { method: 'GET', path: '/v1/guest/shops/:shopPublicId/pricing-revision', audience: 'guest', note: '軽量 pcr プローブ' },
+            // 来客セッション（Gate 直・VPS なし）。/v1/guest/* は WAF で GET 限定のため別プレフィックス。
+            connectSession: { method: 'GET', path: '/v1/guest-session/connect/:sessionId', audience: 'guest', note: 'X-Session-PIN + 要 shopPublicId' },
+            connectOrders: { method: 'GET', path: '/v1/guest-session/connect/:sessionId/orders', audience: 'guest', note: '要 shopPublicId' },
+            joinSession: { method: 'GET', path: '/v1/guest-session/join/:joinToken', audience: 'guest', note: '要 shopPublicId' },
+            openFixedQrSession: { method: 'POST', path: '/v1/guest-session/fixed-qr/open', audience: 'guest' },
+            registerGuestRoster: { method: 'POST', path: '/v1/guest-session/:sessionId/guest-roster', audience: 'guest', note: '要 shopPublicId' },
+            confirmGuestPeoples: { method: 'POST', path: '/v1/guest-session/:sessionId/guest-peoples', audience: 'guest', note: '要 shopPublicId' },
+            placeOrder: { method: 'POST', path: '/v1/guest-session/order/:sessionId', audience: 'guest', note: 'X-Session-PIN + Idempotency-Key + 要 shopPublicId' },
+            staffRequest: { method: 'POST', path: '/v1/guest-session/:sessionId/staff-request', audience: 'guest', note: 'X-Session-PIN + 要 shopPublicId — body { type: CALL|CHECKOUT }' }
+        },
+
+        // スタッフ画面のリアルタイム（Gate Durable Object。VPS /orders/events の置き換え）
+        gateStaff: {
+            eventsTicket: { method: 'POST', path: '/v1/staff-events/ticket', audience: 'staff', note: 'shopId → 60 秒・1 回限りの WebSocket チケット' },
+            eventsSocket: { method: 'GET', path: '/v1/staff-events/ws', audience: 'realtime', note: 'WebSocket。ticket クエリ。ping→pong' }
         }
     };
 
@@ -389,11 +428,20 @@
             myShops: function () { return '/shops/my-shop'; },
             createShop: function () { return '/shops'; },
             myProfile: function () { return '/auth/me/profile'; },
+            ownerCheckout: function () { return '/auth/me/owner-checkout'; },
+            confirmOwnerCheckout: function () { return '/auth/me/owner-checkout/confirm'; },
+            shopSlotCheckout: function () { return '/auth/me/shop-slot-checkout'; },
+            confirmShopSlotCheckout: function () { return '/auth/me/shop-slot-checkout/confirm'; },
             updateMyProfile: function () { return '/auth/me/profile'; },
             setMyPublicId: function () { return '/auth/me/public-id'; },
+            checkMyPublicId: function (publicId) {
+                return '/auth/me/public-id/available?publicId=' + enc(publicId == null ? '' : publicId);
+            },
             myAccountStatus: function () { return '/auth/me/account-status'; },
             passwordResetCompleted: function () { return '/auth/password-reset-completed'; },
             shopDashboard: function (shopId) { return '/shops/' + enc(shopId) + '/dashboard'; },
+            shopDashboardToday: function (shopId) { return '/shops/' + enc(shopId) + '/dashboard/today'; },
+            shopDashboardExport: function (shopId) { return '/shops/' + enc(shopId) + '/dashboard/export.csv'; },
             shopDashboardMonths: function (shopId) { return '/shops/' + enc(shopId) + '/dashboard/months'; },
             shopCashDelta: function (shopId) { return '/shops/' + enc(shopId) + '/cash-delta'; },
             orderPageTemplates: function () { return '/shops/order-page-templates'; },
@@ -437,14 +485,19 @@
             activeSessions: function () { return '/sessions/active'; },
             createSession: function (shopId) { return '/sessions/create/' + enc(shopId); },
             checkoutSession: function (sessionId) { return '/sessions/' + enc(sessionId) + '/checkout'; },
+            checkoutScriptPreview: function (sessionId) { return '/sessions/' + enc(sessionId) + '/checkout-script'; },
             ackStaffRequest: function (sessionId) {
                 return '/sessions/' + enc(sessionId) + '/staff-request/ack';
             },
             sessionDetail: function (sessionId) { return '/sessions/' + enc(sessionId); },
+            sessionGuestLink: function (sessionId) { return '/sessions/' + enc(sessionId) + '/guest-link'; },
             sessionMemo: function (sessionId) { return '/sessions/' + enc(sessionId) + '/memo'; },
             sessionGuestCounts: function (sessionId) { return '/sessions/' + enc(sessionId) + '/guest-counts'; },
             archiveSessions: function () { return '/sessions/archive'; },
             archiveSessionDetail: function (sessionId) { return '/sessions/archive/' + enc(sessionId); },
+            archiveFormalReceipt: function (sessionId) {
+                return '/sessions/archive/' + enc(sessionId) + '/formal-receipt';
+            },
             pendingOrders: function () { return '/orders/pending'; },
             markOrderServed: function (orderId) { return '/orders/' + enc(orderId) + '/served'; },
             serveOrderLine: function (orderId) { return '/orders/' + enc(orderId) + '/serve-line'; },
@@ -580,6 +633,15 @@
             catalogUnpublished: function (shopId) {
                 return '/shops/' + enc(shopId) + '/catalog/unpublished';
             },
+            listMenuDrafts: function (shopId) {
+                return '/shops/' + enc(shopId) + '/catalog/drafts';
+            },
+            saveMenuDraft: function (shopId, draftId) {
+                return '/shops/' + enc(shopId) + '/catalog/drafts/' + enc(draftId);
+            },
+            deleteMenuDraft: function (shopId, draftId) {
+                return '/shops/' + enc(shopId) + '/catalog/drafts/' + enc(draftId);
+            },
             publishCatalog: function (shopId, target) {
                 var query = target ? '?target=' + enc(target) : '';
                 return '/shops/' + enc(shopId) + '/catalog/publish' + query;
@@ -632,8 +694,15 @@
         },
         auth: {
             myProfile: function () { return '/auth/me/profile'; },
+            ownerCheckout: function () { return '/auth/me/owner-checkout'; },
+            confirmOwnerCheckout: function () { return '/auth/me/owner-checkout/confirm'; },
+            shopSlotCheckout: function () { return '/auth/me/shop-slot-checkout'; },
+            confirmShopSlotCheckout: function () { return '/auth/me/shop-slot-checkout/confirm'; },
             updateMyProfile: function () { return '/auth/me/profile'; },
             setMyPublicId: function () { return '/auth/me/public-id'; },
+            checkMyPublicId: function (publicId) {
+                return '/auth/me/public-id/available?publicId=' + enc(publicId == null ? '' : publicId);
+            },
             gateAssertion: function (ttlSeconds) {
                 var q = ttlSeconds != null && ttlSeconds !== ''
                     ? '?ttlSeconds=' + enc(String(ttlSeconds))
@@ -665,7 +734,19 @@
             toppingGroupsForMenu: function (menuId) { return '/v1/guest/topping-groups/menus/' + enc(menuId); },
             orderToppingCatalog: function (shopPublicId) { return '/v1/guest/topping-groups/shops/' + enc(shopPublicId) + '/order-catalog'; },
             orderBundle: function (shopPublicId) { return '/v1/guest/shops/' + enc(shopPublicId) + '/order-bundle'; },
-            pricingRevision: function (shopPublicId) { return '/v1/guest/shops/' + enc(shopPublicId) + '/pricing-revision'; }
+            pricingRevision: function (shopPublicId) { return '/v1/guest/shops/' + enc(shopPublicId) + '/pricing-revision'; },
+            connectSession: function (sessionId) { return '/v1/guest-session/connect/' + enc(sessionId); },
+            connectOrders: function (sessionId) { return '/v1/guest-session/connect/' + enc(sessionId) + '/orders'; },
+            joinSession: function (joinToken) { return '/v1/guest-session/join/' + enc(joinToken); },
+            openFixedQrSession: function () { return '/v1/guest-session/fixed-qr/open'; },
+            registerGuestRoster: function (sessionId) { return '/v1/guest-session/' + enc(sessionId) + '/guest-roster'; },
+            confirmGuestPeoples: function (sessionId) { return '/v1/guest-session/' + enc(sessionId) + '/guest-peoples'; },
+            placeOrder: function (sessionId) { return '/v1/guest-session/order/' + enc(sessionId); },
+            staffRequest: function (sessionId) { return '/v1/guest-session/' + enc(sessionId) + '/staff-request'; }
+        },
+        gateStaff: {
+            eventsTicket: function () { return '/v1/staff-events/ticket'; },
+            eventsSocket: function () { return '/v1/staff-events/ws'; }
         }
     };
 
